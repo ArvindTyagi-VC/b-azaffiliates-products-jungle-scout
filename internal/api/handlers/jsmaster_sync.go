@@ -64,8 +64,10 @@ var (
 // ============================================================================
 
 const (
-	HourlySyncASINLimit    = 50
-	StaleDataThresholdDays = 30
+	HourlySyncASINLimit       = 50
+	StaleDataThresholdDays    = 30
+	ProductNotFoundRetryDays  = 15
+	ProductBatchSize          = 100
 )
 
 // ErrorSummary tracks errors by category for smart logging
@@ -1560,18 +1562,20 @@ func (m *HourlySyncManager) addNewASINsToSyncStatus() (int, error) {
 // selectASINsToSync selects up to 50 ASINs prioritizing new ASINs, then stale ASINs
 func (m *HourlySyncManager) selectASINsToSync() ([]ASINSyncInfo, error) {
 	syncTable := m.stagingClient.TableName("jungle_scout_sync_status")
+	retryThreshold := time.Now().AddDate(0, 0, -ProductNotFoundRetryDays)
 
-	// Priority 1: New ASINs (never synced)
+	// Priority 1: New ASINs (never synced OR product not found but retry period passed)
+	// Skip ASINs where product_fetch_attempted_at is within last 15 days (not found in JS API)
 	newASINsQuery := fmt.Sprintf(`
 		SELECT asin, sales_estimate_data_synced_at
 		FROM %s
 		WHERE has_product_data = false
-		AND product_data_synced_at IS NULL
+		AND (product_fetch_attempted_at IS NULL OR product_fetch_attempted_at < $1)
 		ORDER BY created_at ASC, asin ASC
 		LIMIT %d
 	`, syncTable, HourlySyncASINLimit)
 
-	rows, err := m.stagingClient.DB.Query(newASINsQuery)
+	rows, err := m.stagingClient.DB.Query(newASINsQuery, retryThreshold)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query new ASINs: %w", err)
 	}
@@ -1634,8 +1638,10 @@ func (m *HourlySyncManager) selectASINsToSync() ([]ASINSyncInfo, error) {
 // syncSelectedASINs syncs product and sales data for the selected ASINs
 func (m *HourlySyncManager) syncSelectedASINs(asins []ASINSyncInfo, marketplace string) {
 	asinStrings := make([]string, len(asins))
+	requestedASINs := make(map[string]bool)
 	for i, info := range asins {
 		asinStrings[i] = info.ASIN
+		requestedASINs[info.ASIN] = true
 	}
 
 	// Step 4: Fetch and store product data
@@ -1655,7 +1661,17 @@ func (m *HourlySyncManager) syncSelectedASINs(asins []ASINSyncInfo, marketplace 
 		return
 	}
 
-	successfulASINs := m.storeHourlyProductData(apiResponse, marketplace)
+	// Store product data and get successful ASINs
+	successfulASINs, returnedASINs := m.storeHourlyProductData(apiResponse, marketplace, requestedASINs)
+
+	// Mark ASINs not returned by API as "product not found" (retry in 15 days)
+	notFoundCount := 0
+	for asin := range requestedASINs {
+		if !returnedASINs[asin] {
+			m.markProductNotFound(asin)
+			notFoundCount++
+		}
+	}
 
 	m.statusMutex.Lock()
 	m.status.SuccessfulProductSync = len(successfulASINs)
@@ -1663,7 +1679,11 @@ func (m *HourlySyncManager) syncSelectedASINs(asins []ASINSyncInfo, marketplace 
 	m.status.TotalASINsProcessed = len(asins)
 	m.statusMutex.Unlock()
 
-	// Step 5: Sync sales data for successful ASINs
+	if notFoundCount > 0 {
+		m.addHourlyError("api", fmt.Sprintf("%d ASINs not found in JungleScout API (will retry in 15 days)", notFoundCount))
+	}
+
+	// Step 5: Sync sales data for successful ASINs only
 	asinInfoMap := make(map[string]ASINSyncInfo)
 	for _, info := range asins {
 		asinInfoMap[info.ASIN] = info
@@ -1683,7 +1703,7 @@ func (m *HourlySyncManager) syncSelectedASINs(asins []ASINSyncInfo, marketplace 
 			// New ASIN: fetch 1 year of data
 			startDate = time.Now().AddDate(-1, 0, -1).Format("2006-01-02")
 		} else {
-			// Existing ASIN: fetch from last sync date
+			// Existing ASIN: fetch from last sync date (Option B)
 			startDate = info.SalesEstimateSyncedAt.Format("2006-01-02")
 		}
 
@@ -1709,10 +1729,42 @@ func (m *HourlySyncManager) syncSelectedASINs(asins []ASINSyncInfo, marketplace 
 	m.statusMutex.Unlock()
 }
 
-// storeHourlyProductData stores product data and returns list of successful ASINs
-func (m *HourlySyncManager) storeHourlyProductData(apiResponse *junglescout.ProductAPIResponse, marketplace string) []string {
+// markProductNotFound marks an ASIN as not found in JungleScout API (retry in 15 days)
+func (m *HourlySyncManager) markProductNotFound(asin string) {
+	stagingTable := m.stagingClient.TableName("jungle_scout_sync_status")
+	prodTable := m.productionClient.TableName("jungle_scout_sync_status")
+
+	buildQuery := func(tableName string) string {
+		return fmt.Sprintf(`
+			UPDATE %s
+			SET product_fetch_attempted_at = CURRENT_TIMESTAMP,
+			    error = 'Product not found in JungleScout API',
+			    updated_at = CURRENT_TIMESTAMP
+			WHERE asin = $1
+		`, tableName)
+	}
+
+	// Update staging
+	m.stagingClient.DB.Exec(buildQuery(stagingTable), asin)
+
+	// Update production with retry
+	for attempt := 1; attempt <= 3; attempt++ {
+		_, err := m.productionClient.DB.Exec(buildQuery(prodTable), asin)
+		if err == nil {
+			break
+		}
+		if attempt < 3 {
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+	}
+}
+
+// storeHourlyProductData stores product data and returns (successful ASINs, returned ASINs from API)
+func (m *HourlySyncManager) storeHourlyProductData(apiResponse *junglescout.ProductAPIResponse, marketplace string, requestedASINs map[string]bool) ([]string, map[string]bool) {
+	returnedASINs := make(map[string]bool)
+
 	if apiResponse == nil || len(apiResponse.Data) == 0 {
-		return nil
+		return nil, returnedASINs
 	}
 
 	stagingProductTable := m.stagingClient.TableName("jungle_scout_product_data")
@@ -1785,6 +1837,9 @@ func (m *HourlySyncManager) storeHourlyProductData(apiResponse *junglescout.Prod
 			}
 		}
 
+		// Track this ASIN as returned by the API
+		returnedASINs[asin] = true
+
 		variantsJSON, _ := json.Marshal(attrs.Variants)
 		subcategoryRanksJSON, _ := json.Marshal(attrs.SubcategoryRanks)
 		feeBreakdownJSON, _ := json.Marshal(attrs.FeeBreakdown)
@@ -1853,7 +1908,7 @@ func (m *HourlySyncManager) storeHourlyProductData(apiResponse *junglescout.Prod
 		successfulASINs = append(successfulASINs, asin)
 	}
 
-	return successfulASINs
+	return successfulASINs, returnedASINs
 }
 
 // storeHourlySalesData stores sales data for a single ASIN
