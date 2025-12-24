@@ -64,7 +64,7 @@ var (
 // ============================================================================
 
 const (
-	HourlySyncASINLimit       = 50
+	HourlySyncASINLimit       = 100
 	StaleDataThresholdDays    = 30
 	ProductNotFoundRetryDays  = 15
 	ProductBatchSize          = 100
@@ -105,6 +105,19 @@ type ASINSyncInfo struct {
 	SalesEstimateSyncedAt *time.Time
 }
 
+// SalesDataPoint holds data for a single sales data point for batch insert
+type SalesDataPoint struct {
+	ASIN             string
+	Marketplace      string
+	IsParent         bool
+	IsVariant        bool
+	IsStandalone     bool
+	ParentASIN       *string
+	Date             string
+	EstimatedUnits   int
+	LastKnownPrice   float64
+}
+
 // HourlySyncManager manages the hourly incremental sync process
 type HourlySyncManager struct {
 	stagingClient    *database.PostgreSQLClient
@@ -114,6 +127,15 @@ type HourlySyncManager struct {
 	statusMutex      sync.RWMutex
 	stopRequested    bool
 	apiCallCount     int
+	debugMode        bool // When true, prints verbose logs
+}
+
+// debugLog prints a log message only if debug mode is enabled
+func (m *HourlySyncManager) debugLog(format string, args ...interface{}) {
+	if m.debugMode {
+		msg := fmt.Sprintf(format, args...)
+		log.Printf("[HOURLY_SYNC] %s", msg)
+	}
 }
 
 var (
@@ -122,12 +144,13 @@ var (
 )
 
 // NewHourlySyncManager creates a new hourly sync manager
-func NewHourlySyncManager(stagingClient, productionClient *database.PostgreSQLClient) *HourlySyncManager {
+func NewHourlySyncManager(stagingClient, productionClient *database.PostgreSQLClient, debugMode bool) *HourlySyncManager {
 	return &HourlySyncManager{
 		stagingClient:    stagingClient,
 		productionClient: productionClient,
 		jsClient:         junglescout.NewClient(),
 		apiCallCount:     0,
+		debugMode:        debugMode,
 	}
 }
 
@@ -1339,6 +1362,9 @@ func (m *MasterSyncManager) execOnBothDBs(query string, args ...interface{}) err
 // ============================================================================
 
 // JSHourlySync handles the hourly synchronization endpoint for cloud jobs
+// Query params:
+//   - marketplace: Amazon marketplace (default: "us")
+//   - debug: Enable verbose logging (default: "false")
 func JSHourlySync(stagingClient, productionClient *database.PostgreSQLClient) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		hourlySyncManagerMutex.Lock()
@@ -1353,17 +1379,25 @@ func JSHourlySync(stagingClient, productionClient *database.PostgreSQLClient) gi
 			return
 		}
 
-		globalHourlySyncManager = NewHourlySyncManager(stagingClient, productionClient)
+		// Parse query parameters
+		marketplace := c.DefaultQuery("marketplace", "us")
+		debugMode := c.DefaultQuery("debug", "false") == "true"
+
+		globalHourlySyncManager = NewHourlySyncManager(stagingClient, productionClient, debugMode)
 		hourlySyncManagerMutex.Unlock()
 
-		marketplace := c.DefaultQuery("marketplace", "us")
+		if debugMode {
+			log.Println("[HOURLY_SYNC] ========== DEBUG MODE ENABLED ==========")
+			log.Printf("[HOURLY_SYNC] Starting hourly sync with marketplace=%s", marketplace)
+		}
 
 		// Run sync synchronously (cloud jobs expect completion)
 		globalHourlySyncManager.RunHourlySync(marketplace)
 
 		c.JSON(200, gin.H{
-			"message": "Hourly sync completed",
-			"status":  globalHourlySyncManager.GetStatus(),
+			"message":    "Hourly sync completed",
+			"status":     globalHourlySyncManager.GetStatus(),
+			"debug_mode": debugMode,
 		})
 	}
 }
@@ -1389,6 +1423,10 @@ func GetJSHourlySyncStatus(stagingClient, productionClient *database.PostgreSQLC
 
 // RunHourlySync executes the hourly sync process
 func (m *HourlySyncManager) RunHourlySync(marketplace string) {
+	m.debugLog("========== HOURLY SYNC STARTED ==========")
+	m.debugLog("Marketplace: %s", marketplace)
+	m.debugLog("Debug mode: %v", m.debugMode)
+
 	m.statusMutex.Lock()
 	m.status = &HourlySyncStatus{
 		StartedAt:    time.Now(),
@@ -1405,12 +1443,25 @@ func (m *HourlySyncManager) RunHourlySync(marketplace string) {
 		if m.stopRequested {
 			m.status.StoppedEarly = true
 		}
+		duration := now.Sub(m.status.StartedAt)
 		m.statusMutex.Unlock()
 
+		m.debugLog("========== HOURLY SYNC COMPLETED ==========")
+		m.debugLog("Duration: %v", duration)
+		m.debugLog("Total ASINs processed: %d", m.status.TotalASINsProcessed)
+		m.debugLog("Successful product syncs: %d", m.status.SuccessfulProductSync)
+		m.debugLog("Successful sales syncs: %d", m.status.SuccessfulSalesSync)
+		m.debugLog("Failed ASINs: %d", m.status.FailedASINs)
+		m.debugLog("Total API calls: %d", m.apiCallCount)
+		m.debugLog("Sending Discord notification...")
+
 		m.sendHourlySyncDiscordNotification()
+		m.debugLog("Discord notification sent")
 	}()
 
-	// Step 1: Cleanup - Remove ASINs that no longer exist or are not visible
+	// ==================== STEP 1: CLEANUP ====================
+	m.debugLog("---------- STEP 1: CLEANUP ----------")
+	m.debugLog("Removing ASINs with product_visibility=false from sync_status...")
 	cleanedUp, err := m.cleanupSyncStatus()
 	if err != nil {
 		m.addHourlyError("db", fmt.Sprintf("Cleanup failed: %v", err))
@@ -1419,8 +1470,11 @@ func (m *HourlySyncManager) RunHourlySync(marketplace string) {
 	m.statusMutex.Lock()
 	m.status.CleanedUpASINs = cleanedUp
 	m.statusMutex.Unlock()
+	m.debugLog("Cleanup complete: %d ASINs removed", cleanedUp)
 
-	// Step 2: Add new ASINs to sync_status
+	// ==================== STEP 2: ADD NEW ASINs ====================
+	m.debugLog("---------- STEP 2: ADD NEW ASINs ----------")
+	m.debugLog("Adding new visible ASINs to sync_status...")
 	newASINs, err := m.addNewASINsToSyncStatus()
 	if err != nil {
 		m.addHourlyError("db", fmt.Sprintf("Failed to add new ASINs: %v", err))
@@ -1429,8 +1483,12 @@ func (m *HourlySyncManager) RunHourlySync(marketplace string) {
 	m.statusMutex.Lock()
 	m.status.NewASINsAdded = newASINs
 	m.statusMutex.Unlock()
+	m.debugLog("New ASINs added to sync_status: %d", newASINs)
 
-	// Step 3: Select 50 ASINs to process (priority: new first, then stale)
+	// ==================== STEP 3: SELECT ASINs ====================
+	m.debugLog("---------- STEP 3: SELECT ASINs ----------")
+	m.debugLog("Selecting up to %d ASINs (priority: new first, then stale >%d days)...",
+		HourlySyncASINLimit, StaleDataThresholdDays)
 	asinsToSync, err := m.selectASINsToSync()
 	if err != nil {
 		m.addHourlyError("db", fmt.Sprintf("Failed to select ASINs: %v", err))
@@ -1441,16 +1499,21 @@ func (m *HourlySyncManager) RunHourlySync(marketplace string) {
 	}
 
 	if len(asinsToSync) == 0 {
+		m.debugLog("No ASINs to sync (all data is fresh)")
+		m.debugLog("========== HOURLY SYNC SKIPPED (NO WORK) ==========")
 		return
 	}
 
 	// Count new vs stale
 	newCount, staleCount := 0, 0
+	var newASINsList, staleASINsList []string
 	for _, info := range asinsToSync {
 		if info.IsNew {
 			newCount++
+			newASINsList = append(newASINsList, info.ASIN)
 		} else {
 			staleCount++
+			staleASINsList = append(staleASINsList, info.ASIN)
 		}
 	}
 	m.statusMutex.Lock()
@@ -1458,114 +1521,107 @@ func (m *HourlySyncManager) RunHourlySync(marketplace string) {
 	m.status.StaleASINsSynced = staleCount
 	m.statusMutex.Unlock()
 
-	// Step 4 & 5: Sync product data and sales data for selected ASINs
+	m.debugLog("Selected %d ASINs total:", len(asinsToSync))
+	m.debugLog("  - New ASINs: %d", newCount)
+	m.debugLog("  - Stale ASINs: %d", staleCount)
+	if len(newASINsList) > 0 {
+		m.debugLog("  - New ASIN list: %v", newASINsList)
+	}
+	if len(staleASINsList) > 0 {
+		m.debugLog("  - Stale ASIN list: %v", staleASINsList)
+	}
+
+	// ==================== STEP 4 & 5: SYNC DATA ====================
+	m.debugLog("---------- STEP 4 & 5: SYNC PRODUCT & SALES DATA ----------")
 	m.syncSelectedASINs(asinsToSync, marketplace)
 }
 
 // cleanupSyncStatus removes sync_status records for ASINs with product_visibility=false
+// NOTE: sync_status is staging-only, production writes are skipped
 func (m *HourlySyncManager) cleanupSyncStatus() (int, error) {
+	m.debugLog("[Cleanup] Getting product table name...")
 	productTableName, err := utils.GetTableName(m.stagingClient, "product")
 	if err != nil {
+		m.debugLog("[Cleanup] ERROR: Failed to get product table name: %v", err)
 		return 0, fmt.Errorf("failed to get product table name: %w", err)
 	}
+	m.debugLog("[Cleanup] Product table: %s", productTableName)
 
 	stagingSyncTable := m.stagingClient.TableName("jungle_scout_sync_status")
-	prodSyncTable := m.productionClient.TableName("jungle_scout_sync_status")
+	m.debugLog("[Cleanup] Staging sync table: %s", stagingSyncTable)
 
-	buildDeleteQuery := func(syncTable string) string {
-		return fmt.Sprintf(`
-			DELETE FROM %s
-			WHERE asin NOT IN (
-				SELECT DISTINCT asin
-				FROM %s
-				WHERE product_visibility = true
-				AND asin IS NOT NULL
-				AND asin != ''
-			)
-		`, syncTable, productTableName)
-	}
+	deleteQuery := fmt.Sprintf(`
+		DELETE FROM %s
+		WHERE asin NOT IN (
+			SELECT DISTINCT asin
+			FROM %s
+			WHERE product_visibility = true
+			AND asin IS NOT NULL
+			AND asin != ''
+		)
+	`, stagingSyncTable, productTableName)
 
-	result, err := m.stagingClient.DB.Exec(buildDeleteQuery(stagingSyncTable))
+	m.debugLog("[Cleanup] Executing DELETE on staging...")
+	result, err := m.stagingClient.DB.Exec(deleteQuery)
 	if err != nil {
+		m.debugLog("[Cleanup] ERROR: Staging cleanup failed: %v", err)
 		return 0, fmt.Errorf("staging cleanup failed: %w", err)
 	}
 
 	rowsDeleted, _ := result.RowsAffected()
-
-	// Production with retry
-	var prodErr error
-	for attempt := 1; attempt <= 3; attempt++ {
-		_, prodErr = m.productionClient.DB.Exec(buildDeleteQuery(prodSyncTable))
-		if prodErr == nil {
-			break
-		}
-		if attempt < 3 {
-			time.Sleep(time.Duration(attempt) * time.Second)
-		}
-	}
-
-	if prodErr != nil {
-		return int(rowsDeleted), fmt.Errorf("production cleanup failed after 3 retries: %w", prodErr)
-	}
+	m.debugLog("[Cleanup] Staging: %d rows deleted", rowsDeleted)
+	m.debugLog("[Cleanup] Skipping production (sync_status is staging-only)")
 
 	return int(rowsDeleted), nil
 }
 
 // addNewASINsToSyncStatus inserts ASINs that exist in product table but not in sync_status
+// NOTE: sync_status is staging-only, production writes are skipped
 func (m *HourlySyncManager) addNewASINsToSyncStatus() (int, error) {
+	m.debugLog("[AddNew] Getting product table name...")
 	productTableName, err := utils.GetTableName(m.stagingClient, "product")
 	if err != nil {
+		m.debugLog("[AddNew] ERROR: Failed to get product table name: %v", err)
 		return 0, fmt.Errorf("failed to get product table name: %w", err)
 	}
 
 	stagingSyncTable := m.stagingClient.TableName("jungle_scout_sync_status")
-	prodSyncTable := m.productionClient.TableName("jungle_scout_sync_status")
 
-	buildInsertQuery := func(syncTable string) string {
-		return fmt.Sprintf(`
-			INSERT INTO %s (asin, has_product_data, has_sales_data, updated_at)
-			SELECT DISTINCT p.asin, false, false, CURRENT_TIMESTAMP
-			FROM %s p
-			WHERE p.product_visibility = true
-			AND p.asin IS NOT NULL
-			AND p.asin != ''
-			AND p.asin NOT IN (SELECT asin FROM %s)
-		`, syncTable, productTableName, syncTable)
-	}
+	insertQuery := fmt.Sprintf(`
+		INSERT INTO %s (asin, has_product_data, has_sales_data, updated_at)
+		SELECT DISTINCT p.asin, false, false, CURRENT_TIMESTAMP
+		FROM %s p
+		WHERE p.product_visibility = true
+		AND p.asin IS NOT NULL
+		AND p.asin != ''
+		AND p.asin NOT IN (SELECT asin FROM %s)
+	`, stagingSyncTable, productTableName, stagingSyncTable)
 
-	result, err := m.stagingClient.DB.Exec(buildInsertQuery(stagingSyncTable))
+	m.debugLog("[AddNew] Inserting new ASINs into staging sync_status...")
+	result, err := m.stagingClient.DB.Exec(insertQuery)
 	if err != nil {
+		m.debugLog("[AddNew] ERROR: Staging insert failed: %v", err)
 		return 0, fmt.Errorf("staging insert failed: %w", err)
 	}
 
 	rowsInserted, _ := result.RowsAffected()
-
-	// Production with retry
-	var prodErr error
-	for attempt := 1; attempt <= 3; attempt++ {
-		_, prodErr = m.productionClient.DB.Exec(buildInsertQuery(prodSyncTable))
-		if prodErr == nil {
-			break
-		}
-		if attempt < 3 {
-			time.Sleep(time.Duration(attempt) * time.Second)
-		}
-	}
-
-	if prodErr != nil {
-		return int(rowsInserted), fmt.Errorf("production insert failed after 3 retries: %w", prodErr)
-	}
+	m.debugLog("[AddNew] Staging: %d new ASINs inserted", rowsInserted)
+	m.debugLog("[AddNew] Skipping production (sync_status is staging-only)")
 
 	return int(rowsInserted), nil
 }
 
-// selectASINsToSync selects up to 50 ASINs prioritizing new ASINs, then stale ASINs
+// selectASINsToSync selects up to 100 ASINs prioritizing new ASINs, then stale ASINs
 func (m *HourlySyncManager) selectASINsToSync() ([]ASINSyncInfo, error) {
 	syncTable := m.stagingClient.TableName("jungle_scout_sync_status")
 	retryThreshold := time.Now().AddDate(0, 0, -ProductNotFoundRetryDays)
 
+	m.debugLog("[Select] Sync table: %s", syncTable)
+	m.debugLog("[Select] Retry threshold (15 days): %s", retryThreshold.Format("2006-01-02 15:04:05"))
+
 	// Priority 1: New ASINs (never synced OR product not found but retry period passed)
 	// Skip ASINs where product_fetch_attempted_at is within last 15 days (not found in JS API)
+	m.debugLog("[Select] Querying NEW ASINs (has_product_data=false, retry period passed)...")
 	newASINsQuery := fmt.Sprintf(`
 		SELECT asin, sales_estimate_data_synced_at
 		FROM %s
@@ -1577,6 +1633,7 @@ func (m *HourlySyncManager) selectASINsToSync() ([]ASINSyncInfo, error) {
 
 	rows, err := m.stagingClient.DB.Query(newASINsQuery, retryThreshold)
 	if err != nil {
+		m.debugLog("[Select] ERROR: Failed to query new ASINs: %v", err)
 		return nil, fmt.Errorf("failed to query new ASINs: %w", err)
 	}
 
@@ -1586,6 +1643,7 @@ func (m *HourlySyncManager) selectASINsToSync() ([]ASINSyncInfo, error) {
 		var salesSyncedAt sql.NullTime
 		if err := rows.Scan(&info.ASIN, &salesSyncedAt); err != nil {
 			rows.Close()
+			m.debugLog("[Select] ERROR: Failed to scan new ASIN: %v", err)
 			return nil, fmt.Errorf("failed to scan new ASIN: %w", err)
 		}
 		info.IsNew = true
@@ -1595,11 +1653,16 @@ func (m *HourlySyncManager) selectASINsToSync() ([]ASINSyncInfo, error) {
 		results = append(results, info)
 	}
 	rows.Close()
+	m.debugLog("[Select] Found %d NEW ASINs", len(results))
 
 	// Priority 2: Stale ASINs (>30 days old)
 	remaining := HourlySyncASINLimit - len(results)
+	m.debugLog("[Select] Remaining slots for stale ASINs: %d", remaining)
+
 	if remaining > 0 {
 		staleThreshold := time.Now().AddDate(0, 0, -StaleDataThresholdDays)
+		m.debugLog("[Select] Stale threshold (30 days): %s", staleThreshold.Format("2006-01-02 15:04:05"))
+		m.debugLog("[Select] Querying STALE ASINs (product_data_synced_at < threshold)...")
 
 		staleASINsQuery := fmt.Sprintf(`
 			SELECT asin, sales_estimate_data_synced_at
@@ -1613,14 +1676,17 @@ func (m *HourlySyncManager) selectASINsToSync() ([]ASINSyncInfo, error) {
 
 		staleRows, err := m.stagingClient.DB.Query(staleASINsQuery, staleThreshold)
 		if err != nil {
+			m.debugLog("[Select] ERROR: Failed to query stale ASINs: %v", err)
 			return nil, fmt.Errorf("failed to query stale ASINs: %w", err)
 		}
 
+		staleCount := 0
 		for staleRows.Next() {
 			var info ASINSyncInfo
 			var salesSyncedAt sql.NullTime
 			if err := staleRows.Scan(&info.ASIN, &salesSyncedAt); err != nil {
 				staleRows.Close()
+				m.debugLog("[Select] ERROR: Failed to scan stale ASIN: %v", err)
 				return nil, fmt.Errorf("failed to scan stale ASIN: %w", err)
 			}
 			info.IsNew = false
@@ -1628,15 +1694,20 @@ func (m *HourlySyncManager) selectASINsToSync() ([]ASINSyncInfo, error) {
 				info.SalesEstimateSyncedAt = &salesSyncedAt.Time
 			}
 			results = append(results, info)
+			staleCount++
 		}
 		staleRows.Close()
+		m.debugLog("[Select] Found %d STALE ASINs", staleCount)
 	}
 
+	m.debugLog("[Select] Total ASINs selected: %d", len(results))
 	return results, nil
 }
 
 // syncSelectedASINs syncs product and sales data for the selected ASINs
 func (m *HourlySyncManager) syncSelectedASINs(asins []ASINSyncInfo, marketplace string) {
+	m.debugLog("[SyncASINs] Starting sync for %d ASINs", len(asins))
+
 	asinStrings := make([]string, len(asins))
 	requestedASINs := make(map[string]bool)
 	for i, info := range asins {
@@ -1645,15 +1716,19 @@ func (m *HourlySyncManager) syncSelectedASINs(asins []ASINSyncInfo, marketplace 
 	}
 
 	// Step 4: Fetch and store product data
+	m.debugLog("[SyncASINs] ===== STEP 4: PRODUCT DATA FETCH =====")
+	m.debugLog("[SyncASINs] Calling JungleScout Product API for %d ASINs...", len(asinStrings))
 	apiResponse, err := m.jsClient.FetchProductData(asinStrings, marketplace)
 	m.apiCallCount++
 	m.statusMutex.Lock()
 	m.status.TotalAPICalls = m.apiCallCount
 	m.statusMutex.Unlock()
+	m.debugLog("[SyncASINs] API call #%d completed", m.apiCallCount)
 
 	if err != nil {
 		m.addHourlyError("api", fmt.Sprintf("Product fetch failed: %v", err))
 		log.Printf("[HOURLY_SYNC] CRITICAL: Product fetch failed: %v", err)
+		m.debugLog("[SyncASINs] ERROR: Product API call failed: %v", err)
 		m.statusMutex.Lock()
 		m.status.FailedASINs = len(asins)
 		m.status.TotalASINsProcessed = len(asins)
@@ -1661,16 +1736,32 @@ func (m *HourlySyncManager) syncSelectedASINs(asins []ASINSyncInfo, marketplace 
 		return
 	}
 
+	returnedCount := 0
+	if apiResponse != nil {
+		returnedCount = len(apiResponse.Data)
+	}
+	m.debugLog("[SyncASINs] Product API returned %d products (requested %d)", returnedCount, len(asinStrings))
+
 	// Store product data and get successful ASINs
+	m.debugLog("[SyncASINs] Storing product data to databases...")
 	successfulASINs, returnedASINs := m.storeHourlyProductData(apiResponse, marketplace, requestedASINs)
+	m.debugLog("[SyncASINs] Successfully stored: %d ASINs", len(successfulASINs))
 
 	// Mark ASINs not returned by API as "product not found" (retry in 15 days)
 	notFoundCount := 0
+	var notFoundASINs []string
 	for asin := range requestedASINs {
 		if !returnedASINs[asin] {
 			m.markProductNotFound(asin)
+			notFoundASINs = append(notFoundASINs, asin)
 			notFoundCount++
 		}
+	}
+
+	if notFoundCount > 0 {
+		m.debugLog("[SyncASINs] %d ASINs NOT FOUND in JungleScout API (will retry in 15 days):", notFoundCount)
+		m.debugLog("[SyncASINs] Not found list: %v", notFoundASINs)
+		m.addHourlyError("api", fmt.Sprintf("%d ASINs not found in JungleScout API (will retry in 15 days)", notFoundCount))
 	}
 
 	m.statusMutex.Lock()
@@ -1679,87 +1770,143 @@ func (m *HourlySyncManager) syncSelectedASINs(asins []ASINSyncInfo, marketplace 
 	m.status.TotalASINsProcessed = len(asins)
 	m.statusMutex.Unlock()
 
-	if notFoundCount > 0 {
-		m.addHourlyError("api", fmt.Sprintf("%d ASINs not found in JungleScout API (will retry in 15 days)", notFoundCount))
-	}
+	m.debugLog("[SyncASINs] Product sync summary: %d success, %d failed, %d not found",
+		len(successfulASINs), len(asins)-len(successfulASINs)-notFoundCount, notFoundCount)
 
 	// Step 5: Sync sales data for successful ASINs only
+	m.debugLog("[SyncASINs] ===== STEP 5: SALES DATA FETCH =====")
+	m.debugLog("[SyncASINs] Fetching sales data for %d successful product ASINs using 5-worker pool...", len(successfulASINs))
+
+	// Build map for quick lookup of ASIN info
 	asinInfoMap := make(map[string]ASINSyncInfo)
 	for _, info := range asins {
 		asinInfoMap[info.ASIN] = info
 	}
 
-	salesSuccessCount := 0
-	for _, asin := range successfulASINs {
-		info, exists := asinInfoMap[asin]
-		if !exists {
-			continue
-		}
+	// Worker pool for concurrent sales fetching (same pattern as Master Sync)
+	var salesSuccessCount int32
+	var salesFailCount int32
+	workerCount := 5
+	asinChan := make(chan string, len(successfulASINs))
+	var wg sync.WaitGroup
 
-		endDate := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
-		var startDate string
+	// Start workers
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
 
-		if info.SalesEstimateSyncedAt == nil {
-			// New ASIN: fetch 1 year of data
-			startDate = time.Now().AddDate(-1, 0, -1).Format("2006-01-02")
-		} else {
-			// Existing ASIN: fetch from last sync date (Option B)
-			startDate = info.SalesEstimateSyncedAt.Format("2006-01-02")
-		}
+			for asin := range asinChan {
+				// Check if we should stop processing due to critical errors
+				if m.stopRequested {
+					m.debugLog("[Worker %d] Stopping due to critical errors", workerID)
+					return
+				}
 
-		salesResponse, err := m.jsClient.FetchSalesEstimateData(asin, marketplace, startDate, endDate)
-		m.apiCallCount++
-		m.statusMutex.Lock()
-		m.status.TotalAPICalls = m.apiCallCount
-		m.statusMutex.Unlock()
+				info, exists := asinInfoMap[asin]
+				if !exists {
+					continue
+				}
 
-		if err != nil {
-			m.addHourlyError("api", fmt.Sprintf("Sales fetch for %s failed: %v", asin, err))
-			m.updateHourlySyncStatus(asin, true, false, fmt.Sprintf("Sales fetch error: %v", err))
-			continue
-		}
+				endDate := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+				var startDate string
+				var dateRangeDesc string
 
-		if m.storeHourlySalesData(salesResponse, marketplace) {
-			salesSuccessCount++
-		}
+				if info.SalesEstimateSyncedAt == nil {
+					// New ASIN: fetch 1 year of data
+					startDate = time.Now().AddDate(-1, 0, -1).Format("2006-01-02")
+					dateRangeDesc = "1 year (new ASIN)"
+				} else {
+					// Existing ASIN: fetch from last sync date
+					startDate = info.SalesEstimateSyncedAt.Format("2006-01-02")
+					dateRangeDesc = fmt.Sprintf("since last sync (%s)", startDate)
+				}
+
+				m.debugLog("[Worker %d] Fetching sales for ASIN %s: %s to %s (%s)",
+					workerID, asin, startDate, endDate, dateRangeDesc)
+
+				salesResponse, err := m.jsClient.FetchSalesEstimateData(asin, marketplace, startDate, endDate)
+
+				// Increment API call counter (thread-safe)
+				m.statusMutex.Lock()
+				m.apiCallCount++
+				m.status.TotalAPICalls = m.apiCallCount
+				m.statusMutex.Unlock()
+
+				if err != nil {
+					m.debugLog("[Worker %d] ERROR: Sales fetch for %s failed: %v", workerID, asin, err)
+					m.addHourlyError("api", fmt.Sprintf("Sales fetch for %s failed: %v", asin, err))
+					m.updateHourlySyncStatus(asin, true, false, fmt.Sprintf("Sales fetch error: %v", err))
+					atomic.AddInt32(&salesFailCount, 1)
+					continue
+				}
+
+				dataPoints := 0
+				if salesResponse != nil && len(salesResponse.Data) > 0 {
+					dataPoints = len(salesResponse.Data[0].Attributes.Data)
+				}
+				m.debugLog("[Worker %d] Sales API returned %d data points for ASIN %s", workerID, dataPoints, asin)
+
+				if m.storeHourlySalesData(salesResponse, marketplace) {
+					atomic.AddInt32(&salesSuccessCount, 1)
+					m.debugLog("[Worker %d] Successfully stored sales data for ASIN %s", workerID, asin)
+				} else {
+					atomic.AddInt32(&salesFailCount, 1)
+					m.debugLog("[Worker %d] Failed to store sales data for ASIN %s", workerID, asin)
+
+					// Check if critical DB error occurred
+					if m.stopRequested {
+						m.debugLog("[Worker %d] Stopping due to critical database error", workerID)
+						return
+					}
+				}
+			}
+		}(i)
 	}
 
+	// Send ASINs to workers
+	for _, asin := range successfulASINs {
+		asinChan <- asin
+	}
+	close(asinChan)
+
+	// Wait for all workers to complete
+	wg.Wait()
+
 	m.statusMutex.Lock()
-	m.status.SuccessfulSalesSync = salesSuccessCount
+	m.status.SuccessfulSalesSync = int(salesSuccessCount)
 	m.statusMutex.Unlock()
+
+	m.debugLog("[SyncASINs] Sales sync summary: %d successful, %d failed", salesSuccessCount, salesFailCount)
+	m.debugLog("[SyncASINs] Total API calls made: %d", m.apiCallCount)
 }
 
 // markProductNotFound marks an ASIN as not found in JungleScout API (retry in 15 days)
+// NOTE: sync_status is staging-only, production writes are skipped
 func (m *HourlySyncManager) markProductNotFound(asin string) {
+	m.debugLog("[NotFound] Marking ASIN %s as 'product not found' (will retry in %d days)", asin, ProductNotFoundRetryDays)
+
 	stagingTable := m.stagingClient.TableName("jungle_scout_sync_status")
-	prodTable := m.productionClient.TableName("jungle_scout_sync_status")
 
-	buildQuery := func(tableName string) string {
-		return fmt.Sprintf(`
-			UPDATE %s
-			SET product_fetch_attempted_at = CURRENT_TIMESTAMP,
-			    error = 'Product not found in JungleScout API',
-			    updated_at = CURRENT_TIMESTAMP
-			WHERE asin = $1
-		`, tableName)
-	}
+	updateQuery := fmt.Sprintf(`
+		UPDATE %s
+		SET product_fetch_attempted_at = CURRENT_TIMESTAMP,
+		    error = 'Product not found in JungleScout API',
+		    updated_at = CURRENT_TIMESTAMP
+		WHERE asin = $1
+	`, stagingTable)
 
-	// Update staging
-	m.stagingClient.DB.Exec(buildQuery(stagingTable), asin)
-
-	// Update production with retry
-	for attempt := 1; attempt <= 3; attempt++ {
-		_, err := m.productionClient.DB.Exec(buildQuery(prodTable), asin)
-		if err == nil {
-			break
-		}
-		if attempt < 3 {
-			time.Sleep(time.Duration(attempt) * time.Second)
-		}
+	// Update staging only
+	_, err := m.stagingClient.DB.Exec(updateQuery, asin)
+	if err != nil {
+		m.debugLog("[NotFound] ERROR: Failed to update staging for ASIN %s: %v", asin, err)
+	} else {
+		m.debugLog("[NotFound] Staging updated for ASIN %s", asin)
 	}
 }
 
 // storeHourlyProductData stores product data and returns (successful ASINs, returned ASINs from API)
+// NOTE: sync_status is staging-only, production only gets product_data writes
 func (m *HourlySyncManager) storeHourlyProductData(apiResponse *junglescout.ProductAPIResponse, marketplace string, requestedASINs map[string]bool) ([]string, map[string]bool) {
 	returnedASINs := make(map[string]bool)
 
@@ -1770,7 +1917,6 @@ func (m *HourlySyncManager) storeHourlyProductData(apiResponse *junglescout.Prod
 	stagingProductTable := m.stagingClient.TableName("jungle_scout_product_data")
 	stagingStatusTable := m.stagingClient.TableName("jungle_scout_sync_status")
 	prodProductTable := m.productionClient.TableName("jungle_scout_product_data")
-	prodStatusTable := m.productionClient.TableName("jungle_scout_sync_status")
 	reportDate := time.Now().Format("2006-01-02")
 
 	buildProductQuery := func(tableName string) string {
@@ -1886,12 +2032,11 @@ func (m *HourlySyncManager) storeHourlyProductData(apiResponse *junglescout.Prod
 		}
 		m.stagingClient.DB.Exec(buildStatusQuery(stagingStatusTable), asin, true, nil, time.Now())
 
-		// Production with retry
+		// Production with retry (product_data only, sync_status is staging-only)
 		var prodErr error
 		for attempt := 1; attempt <= 3; attempt++ {
 			_, prodErr = m.productionClient.DB.Exec(buildProductQuery(prodProductTable), productArgs...)
 			if prodErr == nil {
-				m.productionClient.DB.Exec(buildStatusQuery(prodStatusTable), asin, true, nil, time.Now())
 				break
 			}
 			if attempt < 3 {
@@ -1901,7 +2046,6 @@ func (m *HourlySyncManager) storeHourlyProductData(apiResponse *junglescout.Prod
 
 		if prodErr != nil {
 			m.addHourlyError("db", fmt.Sprintf("Production product store for %s failed: %v", asin, prodErr))
-			m.productionClient.DB.Exec(buildStatusQuery(prodStatusTable), asin, false, fmt.Sprintf("Failed after 3 retries: %v", prodErr), nil)
 			continue
 		}
 
@@ -1911,7 +2055,70 @@ func (m *HourlySyncManager) storeHourlyProductData(apiResponse *junglescout.Prod
 	return successfulASINs, returnedASINs
 }
 
-// storeHourlySalesData stores sales data for a single ASIN
+// batchInsertSalesData inserts multiple sales data points in a single query for better performance
+// Returns number of rows inserted and any error
+func (m *HourlySyncManager) batchInsertSalesData(db *sql.DB, tableName string, dataPoints []SalesDataPoint, batchSize int) (int, error) {
+	if len(dataPoints) == 0 {
+		return 0, nil
+	}
+
+	totalInserted := 0
+
+	// Process in batches
+	for i := 0; i < len(dataPoints); i += batchSize {
+		end := i + batchSize
+		if end > len(dataPoints) {
+			end = len(dataPoints)
+		}
+		batch := dataPoints[i:end]
+
+		// Build multi-row INSERT query
+		// Each row has 9 parameters
+		var valueStrings []string
+		var args []interface{}
+		paramCount := 1
+
+		for _, dp := range batch {
+			valueStrings = append(valueStrings, fmt.Sprintf(
+				"($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
+				paramCount, paramCount+1, paramCount+2, paramCount+3, paramCount+4,
+				paramCount+5, paramCount+6, paramCount+7, paramCount+8,
+			))
+			args = append(args,
+				dp.ASIN, dp.Marketplace, dp.IsParent, dp.IsVariant, dp.IsStandalone,
+				dp.ParentASIN, dp.Date, dp.EstimatedUnits, dp.LastKnownPrice,
+			)
+			paramCount += 9
+		}
+
+		query := fmt.Sprintf(`
+			INSERT INTO %s (asin, marketplace, is_parent, is_variant, is_standalone,
+			                parent_asin, date, estimated_units_sold, last_known_price)
+			VALUES %s
+			ON CONFLICT (asin, marketplace, date)
+			DO UPDATE SET
+				is_parent = EXCLUDED.is_parent,
+				is_variant = EXCLUDED.is_variant,
+				is_standalone = EXCLUDED.is_standalone,
+				parent_asin = EXCLUDED.parent_asin,
+				estimated_units_sold = EXCLUDED.estimated_units_sold,
+				last_known_price = EXCLUDED.last_known_price,
+				updated_at = CURRENT_TIMESTAMP
+		`, tableName, strings.Join(valueStrings, ", "))
+
+		_, err := db.Exec(query, args...)
+		if err != nil {
+			return totalInserted, fmt.Errorf("batch insert failed at offset %d: %w", i, err)
+		}
+
+		totalInserted += len(batch)
+	}
+
+	return totalInserted, nil
+}
+
+// storeHourlySalesData stores sales data for a single ASIN using batch inserts
+// NOTE: sync_status is staging-only, production only gets sales_estimate_data writes
 func (m *HourlySyncManager) storeHourlySalesData(apiResponse *junglescout.SalesEstimateAPIResponse, marketplace string) bool {
 	if apiResponse == nil || len(apiResponse.Data) == 0 {
 		return false
@@ -1920,7 +2127,6 @@ func (m *HourlySyncManager) storeHourlySalesData(apiResponse *junglescout.SalesE
 	stagingSalesTable := m.stagingClient.TableName("jungle_scout_sales_estimate_data")
 	stagingStatusTable := m.stagingClient.TableName("jungle_scout_sync_status")
 	prodSalesTable := m.productionClient.TableName("jungle_scout_sales_estimate_data")
-	prodStatusTable := m.productionClient.TableName("jungle_scout_sync_status")
 
 	jsData := apiResponse.Data[0]
 	attrs := jsData.Attributes
@@ -1930,75 +2136,67 @@ func (m *HourlySyncManager) storeHourlySalesData(apiResponse *junglescout.SalesE
 		parentASIN = &attrs.ParentASIN
 	}
 
-	buildSalesQuery := func(tableName string) string {
-		return fmt.Sprintf(`
-			INSERT INTO %s (asin, marketplace, is_parent, is_variant, is_standalone,
-			                parent_asin, date, estimated_units_sold, last_known_price)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-			ON CONFLICT (asin, marketplace, date)
-			DO UPDATE SET
-				is_parent = EXCLUDED.is_parent, is_variant = EXCLUDED.is_variant,
-				is_standalone = EXCLUDED.is_standalone, parent_asin = EXCLUDED.parent_asin,
-				estimated_units_sold = EXCLUDED.estimated_units_sold,
-				last_known_price = EXCLUDED.last_known_price, updated_at = CURRENT_TIMESTAMP
-		`, tableName)
+	// Convert API response to SalesDataPoint slice for batch insert
+	dataPoints := make([]SalesDataPoint, 0, len(attrs.Data))
+	for _, dp := range attrs.Data {
+		dataPoints = append(dataPoints, SalesDataPoint{
+			ASIN:           attrs.ASIN,
+			Marketplace:    marketplace,
+			IsParent:       attrs.IsParent,
+			IsVariant:      attrs.IsVariant,
+			IsStandalone:   attrs.IsStandalone,
+			ParentASIN:     parentASIN,
+			Date:           dp.Date,
+			EstimatedUnits: dp.EstimatedUnitsSold,
+			LastKnownPrice: dp.LastKnownPrice,
+		})
 	}
 
-	successCount := 0
-	for _, dataPoint := range attrs.Data {
-		args := []interface{}{
-			attrs.ASIN, marketplace, attrs.IsParent, attrs.IsVariant,
-			attrs.IsStandalone, parentASIN, dataPoint.Date,
-			dataPoint.EstimatedUnitsSold, dataPoint.LastKnownPrice,
-		}
+	batchSize := 100 // Optimal batch size for PostgreSQL
 
-		// Staging write
-		_, err := m.stagingClient.DB.Exec(buildSalesQuery(stagingSalesTable), args...)
-		if err != nil {
-			m.addHourlyError("db", fmt.Sprintf("Staging sales store for %s failed: %v", attrs.ASIN, err))
-			continue
-		}
+	// Step 1: Batch insert to STAGING
+	stagingInserted, stagingErr := m.batchInsertSalesData(m.stagingClient.DB, stagingSalesTable, dataPoints, batchSize)
+	if stagingErr != nil {
+		m.addHourlyError("db", fmt.Sprintf("Staging sales batch insert for %s failed: %v", attrs.ASIN, stagingErr))
+		m.debugLog("[Sales] CRITICAL: Staging batch insert failed for %s: %v", attrs.ASIN, stagingErr)
+		m.stopRequested = true
+		return false
+	}
+	m.debugLog("[Sales] Staging: inserted %d data points for ASIN %s", stagingInserted, attrs.ASIN)
 
-		// Production with retry
-		var prodErr error
-		for attempt := 1; attempt <= 3; attempt++ {
-			_, prodErr = m.productionClient.DB.Exec(buildSalesQuery(prodSalesTable), args...)
-			if prodErr == nil {
-				break
-			}
-			if attempt < 3 {
-				time.Sleep(time.Duration(attempt) * time.Second)
-			}
+	// Step 2: Batch insert to PRODUCTION with retry
+	var prodErr error
+	var prodInserted int
+	for attempt := 1; attempt <= 3; attempt++ {
+		prodInserted, prodErr = m.batchInsertSalesData(m.productionClient.DB, prodSalesTable, dataPoints, batchSize)
+		if prodErr == nil {
+			break
 		}
-
-		if prodErr != nil {
-			m.addHourlyError("db", fmt.Sprintf("Production sales store for %s failed: %v", attrs.ASIN, prodErr))
-			continue
+		m.debugLog("[Sales] Production batch insert attempt %d for %s failed: %v", attempt, attrs.ASIN, prodErr)
+		if attempt < 3 {
+			time.Sleep(time.Duration(attempt) * time.Second)
 		}
-
-		successCount++
 	}
 
-	if successCount > 0 {
-		buildSuccessStatusQuery := func(tableName string) string {
-			return fmt.Sprintf(`
-				UPDATE %s
-				SET has_sales_data = true, sales_estimate_data_synced_at = CURRENT_TIMESTAMP,
-				    error = NULL, updated_at = CURRENT_TIMESTAMP
-				WHERE asin = $1
-			`, tableName)
-		}
+	if prodErr != nil {
+		m.addHourlyError("db", fmt.Sprintf("Production sales batch insert for %s failed after 3 retries: %v", attrs.ASIN, prodErr))
+		m.debugLog("[Sales] CRITICAL: Production batch insert failed for %s after 3 retries: %v", attrs.ASIN, prodErr)
+		m.stopRequested = true
+		return false
+	}
+	m.debugLog("[Sales] Production: inserted %d data points for ASIN %s", prodInserted, attrs.ASIN)
 
-		m.stagingClient.DB.Exec(buildSuccessStatusQuery(stagingStatusTable), attrs.ASIN)
-		for attempt := 1; attempt <= 3; attempt++ {
-			_, err := m.productionClient.DB.Exec(buildSuccessStatusQuery(prodStatusTable), attrs.ASIN)
-			if err == nil {
-				break
-			}
-			if attempt < 3 {
-				time.Sleep(time.Duration(attempt) * time.Second)
-			}
-		}
+	// Update sync_status (staging only)
+	if stagingInserted > 0 {
+		updateStatusQuery := fmt.Sprintf(`
+			UPDATE %s
+			SET has_sales_data = true, sales_estimate_data_synced_at = CURRENT_TIMESTAMP,
+			    error = NULL, updated_at = CURRENT_TIMESTAMP
+			WHERE asin = $1
+		`, stagingStatusTable)
+
+		m.stagingClient.DB.Exec(updateStatusQuery, attrs.ASIN)
+		m.debugLog("[Sales] Updated sync_status for ASIN %s (staging-only)", attrs.ASIN)
 		return true
 	}
 
@@ -2006,9 +2204,9 @@ func (m *HourlySyncManager) storeHourlySalesData(apiResponse *junglescout.SalesE
 }
 
 // updateHourlySyncStatus updates sync status for a specific ASIN
+// NOTE: sync_status is staging-only, production writes are skipped
 func (m *HourlySyncManager) updateHourlySyncStatus(asin string, hasProductData, hasSalesData bool, errorMsg string) {
 	stagingTable := m.stagingClient.TableName("jungle_scout_sync_status")
-	prodTable := m.productionClient.TableName("jungle_scout_sync_status")
 
 	buildQuery := func(tableName string) string {
 		if errorMsg != "" {
@@ -2031,15 +2229,7 @@ func (m *HourlySyncManager) updateHourlySyncStatus(asin string, hasProductData, 
 	}
 
 	m.stagingClient.DB.Exec(buildQuery(stagingTable), args...)
-	for attempt := 1; attempt <= 3; attempt++ {
-		_, err := m.productionClient.DB.Exec(buildQuery(prodTable), args...)
-		if err == nil {
-			break
-		}
-		if attempt < 3 {
-			time.Sleep(time.Duration(attempt) * time.Second)
-		}
-	}
+	m.debugLog("[SyncStatus] Skipping production update (sync_status is staging-only)")
 }
 
 // addHourlyError adds an error to the error summary

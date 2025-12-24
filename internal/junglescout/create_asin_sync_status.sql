@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS dev_az_jungle_scout_sync_status (
     error TEXT,
     product_data_synced_at TIMESTAMP,
     sales_estimate_data_synced_at TIMESTAMP,
+    product_fetch_attempted_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

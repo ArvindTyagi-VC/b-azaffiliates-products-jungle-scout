@@ -16,19 +16,6 @@ func (s *Server) setupRoutes() {
 	router.GET("/health", s.healthCheck)
 	router.GET("/test-db", s.testDatabaseConnectivity)
 
-	// Version endpoint
-	// router.GET("/version", func(c *gin.Context) {
-	// 	c.JSON(200, gin.H{
-	// 		"version":            "2.0.0",
-	// 		"build_date":         time.Now().Format(time.RFC3339),
-	// 		"name":               "Amazon Affiliate Backend - Rewritten",
-	// 		"postgresql_enabled": s.postgresqlClient != nil,
-	// 		// "firestore_enabled":  s.firestoreClient != nil,
-	// 		"databases": "postgresql+firestore",
-
-	// Static files endpoint
-	// Public routes (no authentication required)
-
 	protected := router.Group("")
 	protected.Use(auth.JWTAuth())
 	adminRoutes := protected.Group("/admin")
