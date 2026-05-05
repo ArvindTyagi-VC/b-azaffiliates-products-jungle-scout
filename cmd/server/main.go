@@ -7,6 +7,7 @@ import (
 
 	"azaffiliates/internal/api"
 	"azaffiliates/internal/database"
+	"azaffiliates/internal/junglescout"
 )
 
 func main() {
@@ -60,8 +61,11 @@ func main() {
 		port = "8080" // Default port
 	}
 
+	// Build the JungleScout API usage recorder (dual-write).
+	apiUsageRecorder := junglescout.NewDBAPIUsageRecorder(stagingClient, productionClient)
+
 	// Initialize server with both database clients
-	server := api.NewServer(stagingClient, productionClient)
+	server := api.NewServer(stagingClient, productionClient, apiUsageRecorder)
 
 	log.Printf("Starting server on port %s", port)
 	server.Run(":" + port)

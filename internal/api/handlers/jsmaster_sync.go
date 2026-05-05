@@ -143,30 +143,37 @@ var (
 	hourlySyncManagerMutex  sync.Mutex
 )
 
-// NewHourlySyncManager creates a new hourly sync manager
-func NewHourlySyncManager(stagingClient, productionClient *database.PostgreSQLClient, debugMode bool) *HourlySyncManager {
+// NewHourlySyncManager creates a new hourly sync manager. Pass a recorder to
+// persist per-call API usage; nil disables recording.
+func NewHourlySyncManager(stagingClient, productionClient *database.PostgreSQLClient, debugMode bool, recorder junglescout.APIUsageRecorder) *HourlySyncManager {
+	jsClient := junglescout.NewClient()
+	jsClient.SetUsageRecorder(recorder)
 	return &HourlySyncManager{
 		stagingClient:    stagingClient,
 		productionClient: productionClient,
-		jsClient:         junglescout.NewClient(),
+		jsClient:         jsClient,
 		apiCallCount:     0,
 		debugMode:        debugMode,
 	}
 }
 
-// NewMasterSyncManager creates a new sync manager with both staging and production clients
-func NewMasterSyncManager(stagingClient, productionClient *database.PostgreSQLClient) *MasterSyncManager {
+// NewMasterSyncManager creates a new sync manager with both staging and
+// production clients. Pass a recorder to persist per-call API usage; nil
+// disables recording.
+func NewMasterSyncManager(stagingClient, productionClient *database.PostgreSQLClient, recorder junglescout.APIUsageRecorder) *MasterSyncManager {
+	jsClient := junglescout.NewClient()
+	jsClient.SetUsageRecorder(recorder)
 	return &MasterSyncManager{
 		stagingClient:    stagingClient,
 		productionClient: productionClient,
-		jsClient:         junglescout.NewClient(), // Simple client without tracking
+		jsClient:         jsClient,
 		logger:           log.New(log.Writer(), "[MASTER_SYNC] ", log.LstdFlags|log.Lshortfile),
 		apiCallCount:     0,
 	}
 }
 
 // JSMasterSync handles the master synchronization of all ASINs
-func JSMasterSync(stagingClient, productionClient *database.PostgreSQLClient) gin.HandlerFunc {
+func JSMasterSync(stagingClient, productionClient *database.PostgreSQLClient, recorder junglescout.APIUsageRecorder) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Check if sync is already running
 		syncManagerMutex.Lock()
@@ -180,7 +187,7 @@ func JSMasterSync(stagingClient, productionClient *database.PostgreSQLClient) gi
 		}
 
 		// Create new sync manager with both clients
-		globalSyncManager = NewMasterSyncManager(stagingClient, productionClient)
+		globalSyncManager = NewMasterSyncManager(stagingClient, productionClient, recorder)
 		syncManagerMutex.Unlock()
 
 		// Get query parameters
@@ -1365,7 +1372,7 @@ func (m *MasterSyncManager) execOnBothDBs(query string, args ...interface{}) err
 // Query params:
 //   - marketplace: Amazon marketplace (default: "us")
 //   - debug: Enable verbose logging (default: "false")
-func JSHourlySync(stagingClient, productionClient *database.PostgreSQLClient) gin.HandlerFunc {
+func JSHourlySync(stagingClient, productionClient *database.PostgreSQLClient, recorder junglescout.APIUsageRecorder) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		hourlySyncManagerMutex.Lock()
 		if globalHourlySyncManager != nil &&
@@ -1383,7 +1390,7 @@ func JSHourlySync(stagingClient, productionClient *database.PostgreSQLClient) gi
 		marketplace := c.DefaultQuery("marketplace", "us")
 		debugMode := c.DefaultQuery("debug", "false") == "true"
 
-		globalHourlySyncManager = NewHourlySyncManager(stagingClient, productionClient, debugMode)
+		globalHourlySyncManager = NewHourlySyncManager(stagingClient, productionClient, debugMode, recorder)
 		hourlySyncManagerMutex.Unlock()
 
 		if debugMode {

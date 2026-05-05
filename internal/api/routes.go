@@ -21,11 +21,11 @@ func (s *Server) setupRoutes() {
 	adminRoutes := protected.Group("/admin")
 	adminRoutes.Use(auth.AdminRoleCheck())
 	{
-		adminRoutes.POST("/sync-jungle-scout", handlers.SyncJungleScoutSalesEstimateData(s.GetStagingClient(), s.GetProductionClient()))
-		adminRoutes.POST("/sync-product-database", handlers.SyncJungleScoutProductDatabaseData(s.GetStagingClient(), s.GetProductionClient()))
+		adminRoutes.POST("/sync-jungle-scout", handlers.SyncJungleScoutSalesEstimateData(s.GetStagingClient(), s.GetProductionClient(), s.GetAPIUsageRecorder()))
+		adminRoutes.POST("/sync-product-database", handlers.SyncJungleScoutProductDatabaseData(s.GetStagingClient(), s.GetProductionClient(), s.GetAPIUsageRecorder()))
 
 		// Master sync endpoints for JungleScout data
-		adminRoutes.POST("/master-sync", handlers.JSMasterSync(s.GetStagingClient(), s.GetProductionClient()))
+		adminRoutes.POST("/master-sync", handlers.JSMasterSync(s.GetStagingClient(), s.GetProductionClient(), s.GetAPIUsageRecorder()))
 		adminRoutes.GET("/master-sync/status", handlers.GetJSSyncStatus(s.GetStagingClient(), s.GetProductionClient()))
 
 	}
@@ -35,7 +35,7 @@ func (s *Server) setupRoutes() {
 	cloudJobRoutes.Use(auth.APIKeyAuth())
 	{
 		// Hourly sync endpoint for cloud scheduler
-		cloudJobRoutes.POST("/hourly-sync", handlers.JSHourlySync(s.GetStagingClient(), s.GetProductionClient()))
+		cloudJobRoutes.POST("/hourly-sync", handlers.JSHourlySync(s.GetStagingClient(), s.GetProductionClient(), s.GetAPIUsageRecorder()))
 		cloudJobRoutes.GET("/hourly-sync/status", handlers.GetJSHourlySyncStatus(s.GetStagingClient(), s.GetProductionClient()))
 	}
 

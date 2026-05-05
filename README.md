@@ -12,6 +12,7 @@ A Go-based microservice for synchronizing product and sales data from JungleScou
 - [Debug Mode](#debug-mode)
 - [Hourly Sync Flow](#hourly-sync-flow)
 - [Master Sync Flow](#master-sync-flow)
+- [API Usage Tracking](#api-usage-tracking)
 - [Performance Optimizations](#performance-optimizations)
 - [Error Handling](#error-handling)
 - [Discord Notifications](#discord-notifications)
@@ -81,6 +82,7 @@ All write operations follow this pattern:
 - **Error Categorization**: Errors grouped by type (DB, API, Parse, Other)
 - **Discord Notifications**: Color-coded sync reports with detailed metrics
 - **Debug Mode**: Verbose logging for testing and troubleshooting (disabled by default)
+- **API Usage Tracking**: Per-day, per-endpoint counter persisted to `js_api_usage` (dual-write); records every JungleScout HTTP roundtrip including retries
 
 ---
 
@@ -250,6 +252,28 @@ CREATE TABLE IF NOT EXISTS {prefix}jungle_scout_sales_estimate_data (
     PRIMARY KEY (asin, marketplace, date)
 );
 ```
+
+### 4. js_api_usage (Both DBs — dual-write)
+
+Counts JungleScout API calls per day, per endpoint. Written to **both** staging
+and production via the same dual-write pattern as the data tables. See
+[API Usage Tracking](#api-usage-tracking) for the full flow.
+
+```sql
+CREATE TABLE IF NOT EXISTS {prefix}js_api_usage (
+    usage_date DATE NOT NULL,
+    endpoint VARCHAR(64) NOT NULL,
+    call_count INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (usage_date, endpoint)
+);
+
+CREATE INDEX IF NOT EXISTS idx_{prefix}js_api_usage_date
+    ON {prefix}js_api_usage(usage_date DESC);
+```
+
+The DDL is in [internal/junglescout/create_js_api_usage.sql](internal/junglescout/create_js_api_usage.sql) (hardcoded `dev_az_` prefix; copy and adjust for production).
 
 ---
 
@@ -537,6 +561,187 @@ Manual full sync of all ASINs with `product_visibility = true`.
 
 ---
 
+## API Usage Tracking
+
+Every JungleScout HTTP request is persisted as a per-day, per-endpoint counter
+in `js_api_usage`. JungleScout bills per request, so this gives an
+authoritative view of consumption that survives across processes and matches
+what the upstream provider sees.
+
+### What gets counted
+
+One increment per **HTTP roundtrip that received a response**, regardless of
+status code. This means:
+
+- A successful 200 response → +1
+- A 4xx / 5xx response → +1 (JS still saw the request)
+- A 429 followed by a successful retry → +2 (each attempt counts)
+- A network error before the request reached JS → **not counted**
+
+This semantic is intentional — it aligns with billing, even though it can
+diverge from the in-memory `total_api_calls` field returned in sync responses
+(which counts top-level invocations, not retries).
+
+### Endpoint keys
+
+Two values are written to the `endpoint` column:
+
+| Key | Source | Triggered by |
+|-----|--------|--------------|
+| `product_database_query` | Product API (POST) | Hourly sync, master sync, `/admin/sync-product-database` |
+| `sales_estimates_query` | Sales API (GET) | Hourly sync, master sync, `/admin/sync-jungle-scout` |
+
+These constants are defined in [internal/junglescout/api_usage.go](internal/junglescout/api_usage.go) (`EndpointProductDatabaseQuery`, `EndpointSalesEstimatesQuery`).
+
+### Architecture
+
+```
++------------------------+
+| JungleScout API call   |
+| (any of 4 entry points)|
++-----------+------------+
+            |
+            v
++------------------------+
+|  HTTP roundtrip        |   <-- request lands at JS
+|  resp, err = client.Do |
++-----------+------------+
+            |
+       err == nil ? --no--> network error: skip recording, retry/abort
+            | yes
+            v
++------------------------+
+| recorder.Record(key)   |
++-----------+------------+
+            |
+            v
++--------------------------------+
+| STAGING upsert (synchronous)   |
+| INSERT ... ON CONFLICT         |
+| SET call_count = call_count+1  |
++-----------+--------------------+
+            |
+       success? --no--> log warning, ABORT (skip prod)
+            | yes
+            v
++--------------------------------+
+| PRODUCTION upsert (3 retries)  |
+| 1s, 2s backoff between tries   |
++-----------+--------------------+
+            |
+       success? --no--> log warning, swallow error
+            | yes
+            v
+       (return — caller never blocked)
+```
+
+### Where increments happen
+
+There are **two paths** that hit the recorder:
+
+**1. Through the JS client** (`internal/junglescout/client.go`)
+
+The `Client.doRequest` method invokes `recorder.Record(endpointKey)` after
+every successful `httpClient.Do(req)`. This covers:
+
+- `Client.FetchProductData` → `product_database_query`
+- `Client.FetchSalesEstimateData` → `sales_estimates_query`
+
+These are called by `MasterSyncManager` and `HourlySyncManager`.
+
+**2. Through legacy raw-HTTP handlers** (`internal/api/handlers/jsmatrix.go`)
+
+The `/admin/sync-jungle-scout` and `/admin/sync-product-database` endpoints
+predate the JS client and use `http.Client` directly. They call
+`recorder.Record(...)` explicitly after each `client.Do(req)`.
+
+### Dual-write semantics
+
+The recorder is constructed with both staging and production DB clients in
+[cmd/server/main.go](cmd/server/main.go) and [cmd/job/main.go](cmd/job/main.go):
+
+```go
+apiUsageRecorder := junglescout.NewDBAPIUsageRecorder(stagingClient, productionClient)
+```
+
+Each `Record` call performs:
+
+1. **Staging upsert** (synchronous, single attempt). On failure: log
+   `[API_USAGE] Staging upsert failed...` and **return without writing prod**
+   (matches the existing data-table dual-write convention).
+2. **Production upsert** (up to 3 attempts, sleeping 1s then 2s between
+   retries). On final failure: log `[API_USAGE] Production upsert failed...`
+   and return.
+
+**Errors are never propagated to the caller.** A counter write must never
+break the JS API call — the recorder is best-effort by design.
+
+### Upsert query
+
+```sql
+INSERT INTO {prefix}js_api_usage (usage_date, endpoint, call_count, created_at, updated_at)
+VALUES (CURRENT_DATE, $1, 1, NOW(), NOW())
+ON CONFLICT (usage_date, endpoint) DO UPDATE
+SET call_count = {prefix}js_api_usage.call_count + 1,
+    updated_at = NOW();
+```
+
+A new row is created on the first call of a (date, endpoint) pair; every
+subsequent call increments `call_count` by 1.
+
+### Querying usage
+
+```sql
+-- Today's usage so far
+SELECT endpoint, call_count, updated_at
+FROM dev_az_js_api_usage
+WHERE usage_date = CURRENT_DATE
+ORDER BY endpoint;
+
+-- Yesterday's totals
+SELECT endpoint, call_count
+FROM dev_az_js_api_usage
+WHERE usage_date = CURRENT_DATE - INTERVAL '1 day';
+
+-- Last 7 days, per endpoint
+SELECT usage_date, endpoint, call_count
+FROM dev_az_js_api_usage
+WHERE usage_date >= CURRENT_DATE - INTERVAL '7 days'
+ORDER BY usage_date DESC, endpoint;
+
+-- Daily total across endpoints
+SELECT usage_date, SUM(call_count) AS total_calls
+FROM dev_az_js_api_usage
+WHERE usage_date >= CURRENT_DATE - INTERVAL '30 days'
+GROUP BY usage_date
+ORDER BY usage_date DESC;
+```
+
+### Failure modes
+
+| Scenario | Behavior |
+|----------|----------|
+| Staging DB down at write time | Warning logged, prod write skipped, JS API call still succeeds |
+| Production DB down at write time | 3 retries with backoff; if all fail, warning logged, JS API call still succeeds |
+| Counter rows missing in production | Staging is the source of truth — production may lag if it was unreachable |
+| New endpoint added in code without DDL change | Works — `endpoint VARCHAR(64)` accepts any value, no schema change needed |
+| Recorder = nil (not configured) | All `Record` calls become no-ops; no errors |
+
+### Caveats
+
+- **Counts include retries.** A 429 plus successful retry counts as 2. The
+  in-memory `total_api_calls` only counts top-level invocations, so the two
+  numbers can diverge during throttling. The persisted counter is the
+  billing-aligned authoritative count.
+- **Staging and production counts can drift.** If staging succeeds but all
+  production retries fail, staging will be ahead. Treat staging as
+  authoritative for any reconciliation.
+- **Both DBs must have the table.** Apply `create_js_api_usage.sql` to staging
+  and a prod-prefixed copy to production before deploying, or every API call
+  will spam `[API_USAGE] Production upsert failed...` warnings.
+
+---
+
 ## Performance Optimizations
 
 ### Batch INSERT for Sales Data
@@ -663,7 +868,13 @@ cp .env.example .env
 # Edit .env with your values
 
 # 3. Run database migrations
-psql -h <host> -U <user> -d <database> -f internal/junglescout/create_asin_sync_status.sql
+# sync_status: staging only
+psql -h <staging-host> -U <user> -d <staging-db> -f internal/junglescout/create_asin_sync_status.sql
+
+# js_api_usage: BOTH databases (dual-write)
+psql -h <staging-host> -U <user> -d <staging-db> -f internal/junglescout/create_js_api_usage.sql
+psql -h <prod-host>    -U <user> -d <prod-db>    -f internal/junglescout/create_js_api_usage.sql
+# (Note: the SQL file hardcodes the dev_az_ prefix — copy/edit for production prefixes.)
 
 # 4. Build and run
 go build -o server .

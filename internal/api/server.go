@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"azaffiliates/internal/database"
+	"azaffiliates/internal/junglescout"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -17,10 +18,13 @@ type Server struct {
 	router           *gin.Engine
 	stagingClient    *database.PostgreSQLClient
 	productionClient *database.PostgreSQLClient
+	apiUsageRecorder junglescout.APIUsageRecorder
 }
 
-// NewServer creates a new server instance with both staging and production clients
-func NewServer(stagingClient, productionClient *database.PostgreSQLClient) *Server {
+// NewServer creates a new server instance with both staging and production
+// clients. The recorder is invoked once per JungleScout API call; pass nil to
+// disable usage tracking.
+func NewServer(stagingClient, productionClient *database.PostgreSQLClient, recorder junglescout.APIUsageRecorder) *Server {
 	// Initialize random seed
 	rand.Seed(time.Now().UnixNano())
 
@@ -76,6 +80,7 @@ func NewServer(stagingClient, productionClient *database.PostgreSQLClient) *Serv
 		router:           router,
 		stagingClient:    stagingClient,
 		productionClient: productionClient,
+		apiUsageRecorder: recorder,
 	}
 
 	// Setup routes
@@ -98,6 +103,11 @@ func (s *Server) GetStagingClient() *database.PostgreSQLClient {
 // GetProductionClient returns the Production PostgreSQL client
 func (s *Server) GetProductionClient() *database.PostgreSQLClient {
 	return s.productionClient
+}
+
+// GetAPIUsageRecorder returns the JungleScout API usage recorder.
+func (s *Server) GetAPIUsageRecorder() junglescout.APIUsageRecorder {
+	return s.apiUsageRecorder
 }
 
 // GetRouter returns the Gin router

@@ -8,6 +8,7 @@ import (
 
 	"azaffiliates/internal/api/handlers"
 	"azaffiliates/internal/database"
+	"azaffiliates/internal/junglescout"
 )
 
 func main() {
@@ -61,9 +62,12 @@ func main() {
 	}
 	log.Println("Production PostgreSQL connectivity test passed")
 
+	// Build the JungleScout API usage recorder (dual-write).
+	apiUsageRecorder := junglescout.NewDBAPIUsageRecorder(stagingClient, productionClient)
+
 	// Create sync manager and run sync
 	log.Println("Creating HourlySyncManager...")
-	syncManager := handlers.NewHourlySyncManager(stagingClient, productionClient, debugMode)
+	syncManager := handlers.NewHourlySyncManager(stagingClient, productionClient, debugMode, apiUsageRecorder)
 
 	log.Println("Starting hourly sync execution...")
 	syncManager.RunHourlySync(marketplace)

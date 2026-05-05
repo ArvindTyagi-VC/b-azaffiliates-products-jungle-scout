@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"azaffiliates/internal/database"
+	"azaffiliates/internal/junglescout"
 
 	"github.com/gin-gonic/gin"
 )
@@ -139,7 +140,7 @@ func execTxWithRetry(prodClient *database.PostgreSQLClient, txFunc func(tx *sql.
 
 // SyncJungleScoutSalesEstimateData handles POST /admin/sync-jungle-scout
 // Writes to staging first, then production with retry
-func SyncJungleScoutSalesEstimateData(stagingClient, productionClient *database.PostgreSQLClient) gin.HandlerFunc {
+func SyncJungleScoutSalesEstimateData(stagingClient, productionClient *database.PostgreSQLClient, recorder junglescout.APIUsageRecorder) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Get query parameters
 		asin := c.Query("asin")
@@ -222,6 +223,10 @@ func SyncJungleScoutSalesEstimateData(stagingClient, productionClient *database.
 			return
 		}
 		defer resp.Body.Close()
+
+		if recorder != nil {
+			recorder.Record(junglescout.EndpointSalesEstimatesQuery)
+		}
 
 		// Check response status
 		if resp.StatusCode != http.StatusOK {
@@ -378,7 +383,7 @@ func SyncJungleScoutSalesEstimateData(stagingClient, productionClient *database.
 
 // SyncJungleScoutProductDatabaseData handles POST /admin/sync-product-database
 // Writes to staging first, then production with retry
-func SyncJungleScoutProductDatabaseData(stagingClient, productionClient *database.PostgreSQLClient) gin.HandlerFunc {
+func SyncJungleScoutProductDatabaseData(stagingClient, productionClient *database.PostgreSQLClient, recorder junglescout.APIUsageRecorder) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Parse request body
 		var requestBody ProductDatabaseRequestBody
@@ -465,6 +470,10 @@ func SyncJungleScoutProductDatabaseData(stagingClient, productionClient *databas
 			return
 		}
 		defer resp.Body.Close()
+
+		if recorder != nil {
+			recorder.Record(junglescout.EndpointProductDatabaseQuery)
+		}
 
 		// Check response status
 		if resp.StatusCode != http.StatusOK {
