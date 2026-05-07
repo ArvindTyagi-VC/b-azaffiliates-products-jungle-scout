@@ -224,10 +224,6 @@ func SyncJungleScoutSalesEstimateData(stagingClient, productionClient *database.
 		}
 		defer resp.Body.Close()
 
-		if recorder != nil {
-			recorder.Record(junglescout.EndpointSalesEstimatesQuery)
-		}
-
 		// Check response status
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
@@ -254,6 +250,10 @@ func SyncJungleScoutSalesEstimateData(stagingClient, productionClient *database.
 				"error": "No data returned from JungleScout API for the specified ASIN",
 			})
 			return
+		}
+
+		if recorder != nil {
+			recorder.Record(junglescout.EndpointSalesEstimatesQuery)
 		}
 
 		// Get the first data item
@@ -471,10 +471,6 @@ func SyncJungleScoutProductDatabaseData(stagingClient, productionClient *databas
 		}
 		defer resp.Body.Close()
 
-		if recorder != nil {
-			recorder.Record(junglescout.EndpointProductDatabaseQuery)
-		}
-
 		// Check response status
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
@@ -501,6 +497,10 @@ func SyncJungleScoutProductDatabaseData(stagingClient, productionClient *databas
 				"error": "No data returned from JungleScout API for the specified ASINs",
 			})
 			return
+		}
+
+		if recorder != nil {
+			recorder.Record(junglescout.EndpointProductDatabaseQuery)
 		}
 
 		reportDate := time.Now().Format("2006-01-02")
