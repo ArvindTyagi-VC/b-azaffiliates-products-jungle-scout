@@ -354,9 +354,9 @@ curl -X POST "https://your-api.com/admin/hourly-sync?marketplace=us" \
 [HOURLY_SYNC] Marketplace: us
 [HOURLY_SYNC] Debug mode: true
 [HOURLY_SYNC] ---------- STEP 1: CLEANUP ----------
-[HOURLY_SYNC] Removing ASINs with product_visibility=false from sync_status...
+[HOURLY_SYNC] Removing ASINs with asin_visibility=false from sync_status...
 [HOURLY_SYNC] [Cleanup] Getting product table name...
-[HOURLY_SYNC] [Cleanup] Product table: dev_az_product
+[HOURLY_SYNC] [Cleanup] Product table: dev_az_asin_1
 [HOURLY_SYNC] [Cleanup] Staging sync table: dev_az_jungle_scout_sync_status
 [HOURLY_SYNC] [Cleanup] Executing DELETE on staging...
 [HOURLY_SYNC] [Cleanup] Staging: 0 rows deleted
@@ -451,7 +451,7 @@ The hourly sync is designed for cloud scheduler execution, processing up to **10
                               v
 +------------------------------------------------------------------+
 | STEP 1: CLEANUP                                                   |
-| Delete sync_status records for ASINs with product_visibility=false|
+| Delete sync_status records for ASINs with asin_visibility=false  |
 | Result: CleanedUpASINs count                                      |
 +------------------------------------------------------------------+
                               |
@@ -542,7 +542,27 @@ The hourly sync is designed for cloud scheduler execution, processing up to **10
 
 ## Master Sync Flow
 
-Manual full sync of all ASINs with `product_visibility = true`.
+Manual full sync of all ASINs with `asin_visibility = true`.
+
+### Data source (vx-3 schema)
+
+The list of ASINs to sync comes from the **active ASIN table**, whose real name is
+resolved at runtime from the `{prefix}frontend_asin` meta table (it holds a single
+`table_name` value — currently `dev_az_asin_1`). The sync reads `asin` and the
+`asin_visibility` boolean from that table.
+
+> Migrated from the vx-2 schema, which used a `{prefix}frontend_product` meta table
+> and a `product_visibility` column. vx-3 renamed these to `frontend_asin` /
+> `asin_visibility`; `asin_visibility = true` is the 1:1 equivalent of the old
+> `product_visibility = true`.
+
+### Staging-only mode
+
+When `DB_PROD_HOST` is empty, the job and server start **staging-only**: the
+production client is `nil` and every production write (product_data,
+sales_estimate_data, api_usage) is skipped. Supply the `DB_PROD_*` vars with a
+**write-capable** production user to re-enable the dual-write. (vx-3 prod is
+read-only, so it runs staging-only.)
 
 ### Sync Modes
 
@@ -553,7 +573,7 @@ Manual full sync of all ASINs with `product_visibility = true`.
 
 ### Flow
 
-1. Fetch all ASINs from product table where `product_visibility = true`
+1. Fetch all ASINs from the active ASIN table where `asin_visibility = true`
 2. Initialize/reset sync_status entries
 3. Sync product data in batches of 100
 4. Sync sales data for ASINs with successful product data
@@ -1046,7 +1066,7 @@ gcloud logging read "resource.type=cloud_run_job AND resource.labels.job_name=ju
 | Issue | Cause | Solution |
 |-------|-------|----------|
 | Discord notification not sending | Webhook URL invalid | Test with curl, check URL |
-| Sync stuck at 0 ASINs | No visible products | Check product_visibility in product table |
+| Sync stuck at 0 ASINs | No visible ASINs | Check asin_visibility in the active ASIN table (resolved via frontend_asin) |
 | All ASINs failing | Database connection | Check DB credentials and connectivity |
 | "Product not found" for all | Invalid marketplace | Verify marketplace parameter |
 | API rate limiting | Too many requests | Reduce concurrency, add delays |

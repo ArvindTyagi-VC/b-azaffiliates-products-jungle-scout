@@ -335,11 +335,11 @@ func (m *MasterSyncManager) RunSync(marketplace string, syncMode string) {
 // fetchActiveASINs retrieves all ASINs from the active products table where visibility=true
 // READ operation - uses stagingClient only
 func (m *MasterSyncManager) fetchActiveASINs() ([]string, error) {
-	tableName, _ := utils.GetTableName(m.stagingClient, "product")
+	tableName, _ := utils.GetTableName(m.stagingClient, "asin")
 	query := fmt.Sprintf(`
 		SELECT DISTINCT asin
 		FROM %s
-		WHERE product_visibility = true AND asin IS NOT NULL AND asin != ''
+		WHERE asin_visibility = true AND asin IS NOT NULL AND asin != ''
 		ORDER BY asin
 	`, tableName)
 
@@ -370,7 +370,10 @@ func (m *MasterSyncManager) fetchActiveASINs() ([]string, error) {
 // WRITE operation - staging first, then production with retry
 func (m *MasterSyncManager) initializeASINSyncStatus(asins []string, syncMode string) error {
 	stagingTableName := m.stagingClient.TableName("jungle_scout_sync_status")
-	productionTableName := m.productionClient.TableName("jungle_scout_sync_status")
+	var productionTableName string
+	if m.productionClient != nil {
+		productionTableName = m.productionClient.TableName("jungle_scout_sync_status")
+	}
 
 	// Resume mode: keep existing sync status, don't reset anything
 	if syncMode != "fresh" {
@@ -425,6 +428,11 @@ func (m *MasterSyncManager) initializeASINSyncStatus(asins []string, syncMode st
 	}
 	m.logger.Println("Staging sync status initialized successfully")
 
+	// Staging-only mode: no production client, nothing more to do.
+	if m.productionClient == nil {
+		return nil
+	}
+
 	// Step 2: Write to PRODUCTION with retry (3 attempts)
 	var prodErr error
 	for attempt := 1; attempt <= 3; attempt++ {
@@ -454,11 +462,13 @@ func (m *MasterSyncManager) syncProductData(allASINs []string, marketplace strin
 		m.addError(fmt.Sprintf("Staging database unreachable: %v", err))
 		return
 	}
-	if err := m.productionClient.DB.Ping(); err != nil {
-		m.logger.Printf("CRITICAL: Production database connection failed before product sync: %v", err)
-		m.stopRequested = true
-		m.addError(fmt.Sprintf("Production database unreachable: %v", err))
-		return
+	if m.productionClient != nil {
+		if err := m.productionClient.DB.Ping(); err != nil {
+			m.logger.Printf("CRITICAL: Production database connection failed before product sync: %v", err)
+			m.stopRequested = true
+			m.addError(fmt.Sprintf("Production database unreachable: %v", err))
+			return
+		}
 	}
 
 	// Filter ASINs to only those that need product data sync (READ from staging)
@@ -582,8 +592,11 @@ func (m *MasterSyncManager) storeProductData(apiResponse *junglescout.ProductAPI
 	// Table names for both databases
 	stagingProductTable := m.stagingClient.TableName("jungle_scout_product_data")
 	stagingStatusTable := m.stagingClient.TableName("jungle_scout_sync_status")
-	prodProductTable := m.productionClient.TableName("jungle_scout_product_data")
-	prodStatusTable := m.productionClient.TableName("jungle_scout_sync_status")
+	var prodProductTable, prodStatusTable string
+	if m.productionClient != nil {
+		prodProductTable = m.productionClient.TableName("jungle_scout_product_data")
+		prodStatusTable = m.productionClient.TableName("jungle_scout_sync_status")
+	}
 	reportDate := time.Now().Format("2006-01-02")
 
 	// Build query template (table name will be substituted)
@@ -739,30 +752,33 @@ func (m *MasterSyncManager) storeProductData(apiResponse *junglescout.ProductAPI
 			break
 		}
 
-		// Step 2: Write to PRODUCTION with retry (3 attempts)
-		var prodErr error
-		for attempt := 1; attempt <= 3; attempt++ {
-			_, prodErr = m.productionClient.DB.Exec(buildProductQuery(prodProductTable), productArgs...)
-			if prodErr == nil {
-				// Update production sync status
-				_, prodErr = m.productionClient.DB.Exec(buildStatusQuery(prodStatusTable), asin, true, nil, time.Now())
+		// Step 2: Write to PRODUCTION with retry (3 attempts).
+		// Skipped entirely when running staging-only (no production client).
+		if m.productionClient != nil {
+			var prodErr error
+			for attempt := 1; attempt <= 3; attempt++ {
+				_, prodErr = m.productionClient.DB.Exec(buildProductQuery(prodProductTable), productArgs...)
 				if prodErr == nil {
-					break
+					// Update production sync status
+					_, prodErr = m.productionClient.DB.Exec(buildStatusQuery(prodStatusTable), asin, true, nil, time.Now())
+					if prodErr == nil {
+						break
+					}
+				}
+				m.logger.Printf("Production write attempt %d for ASIN %s failed: %v", attempt, asin, prodErr)
+				if attempt < 3 {
+					time.Sleep(time.Duration(attempt) * time.Second)
 				}
 			}
-			m.logger.Printf("Production write attempt %d for ASIN %s failed: %v", attempt, asin, prodErr)
-			if attempt < 3 {
-				time.Sleep(time.Duration(attempt) * time.Second)
-			}
-		}
 
-		if prodErr != nil {
-			m.logger.Printf("CRITICAL: Failed to store product data for ASIN %s on production after 3 retries: %v", asin, prodErr)
-			m.productionClient.DB.Exec(buildStatusQuery(prodStatusTable), asin, false, fmt.Sprintf("Failed to store product data after 3 retries: %v", prodErr), nil)
-			criticalError = prodErr
-			m.stopRequested = true
-			m.addError(fmt.Sprintf("Production database failure storing ASIN %s: %v", asin, prodErr))
-			break
+			if prodErr != nil {
+				m.logger.Printf("CRITICAL: Failed to store product data for ASIN %s on production after 3 retries: %v", asin, prodErr)
+				m.productionClient.DB.Exec(buildStatusQuery(prodStatusTable), asin, false, fmt.Sprintf("Failed to store product data after 3 retries: %v", prodErr), nil)
+				criticalError = prodErr
+				m.stopRequested = true
+				m.addError(fmt.Sprintf("Production database failure storing ASIN %s: %v", asin, prodErr))
+				break
+			}
 		}
 
 		successCount++
@@ -790,11 +806,13 @@ func (m *MasterSyncManager) syncSalesEstimateData(marketplace string) {
 		m.addError(fmt.Sprintf("Staging database unreachable: %v", err))
 		return
 	}
-	if err := m.productionClient.DB.Ping(); err != nil {
-		m.logger.Printf("CRITICAL: Production database connection failed before sales sync: %v", err)
-		m.stopRequested = true
-		m.addError(fmt.Sprintf("Production database unreachable: %v", err))
-		return
+	if m.productionClient != nil {
+		if err := m.productionClient.DB.Ping(); err != nil {
+			m.logger.Printf("CRITICAL: Production database connection failed before sales sync: %v", err)
+			m.stopRequested = true
+			m.addError(fmt.Sprintf("Production database unreachable: %v", err))
+			return
+		}
 	}
 
 	// Get ASINs that have product data but no sales data (READ from staging)
@@ -928,8 +946,11 @@ func (m *MasterSyncManager) storeSalesEstimateData(apiResponse *junglescout.Sale
 	// Table names for both databases
 	stagingSalesTable := m.stagingClient.TableName("jungle_scout_sales_estimate_data")
 	stagingStatusTable := m.stagingClient.TableName("jungle_scout_sync_status")
-	prodSalesTable := m.productionClient.TableName("jungle_scout_sales_estimate_data")
-	prodStatusTable := m.productionClient.TableName("jungle_scout_sync_status")
+	var prodSalesTable, prodStatusTable string
+	if m.productionClient != nil {
+		prodSalesTable = m.productionClient.TableName("jungle_scout_sales_estimate_data")
+		prodStatusTable = m.productionClient.TableName("jungle_scout_sync_status")
+	}
 
 	// Process the first (and only) data item
 	jsData := apiResponse.Data[0]
@@ -989,31 +1010,34 @@ func (m *MasterSyncManager) storeSalesEstimateData(apiResponse *junglescout.Sale
 			return false
 		}
 
-		// Step 2: Write to PRODUCTION with retry (3 attempts)
-		var prodErr error
-		for attempt := 1; attempt <= 3; attempt++ {
-			_, prodErr = m.productionClient.DB.Exec(buildSalesQuery(prodSalesTable), args...)
-			if prodErr == nil {
-				break
+		// Step 2: Write to PRODUCTION with retry (3 attempts).
+		// Skipped entirely when running staging-only (no production client).
+		if m.productionClient != nil {
+			var prodErr error
+			for attempt := 1; attempt <= 3; attempt++ {
+				_, prodErr = m.productionClient.DB.Exec(buildSalesQuery(prodSalesTable), args...)
+				if prodErr == nil {
+					break
+				}
+				m.logger.Printf("Production write attempt %d for ASIN %s date %s failed: %v", attempt, attrs.ASIN, dataPoint.Date, prodErr)
+				if attempt < 3 {
+					time.Sleep(time.Duration(attempt) * time.Second)
+				}
 			}
-			m.logger.Printf("Production write attempt %d for ASIN %s date %s failed: %v", attempt, attrs.ASIN, dataPoint.Date, prodErr)
-			if attempt < 3 {
-				time.Sleep(time.Duration(attempt) * time.Second)
+
+			if prodErr != nil {
+				m.logger.Printf("CRITICAL: Failed to insert sales data for ASIN %s, date %s on production after 3 retries: %v",
+					attrs.ASIN, dataPoint.Date, prodErr)
+				failCount++
+				lastError = prodErr
+
+				// Stop on production failure after retries
+				m.addError(fmt.Sprintf("Production database critical failure for ASIN %s: %v", attrs.ASIN, prodErr))
+				m.stopRequested = true
+				m.updateASINSyncStatus(attrs.ASIN, true, false,
+					fmt.Sprintf("Critical production DB error after 3 retries: %v", prodErr))
+				return false
 			}
-		}
-
-		if prodErr != nil {
-			m.logger.Printf("CRITICAL: Failed to insert sales data for ASIN %s, date %s on production after 3 retries: %v",
-				attrs.ASIN, dataPoint.Date, prodErr)
-			failCount++
-			lastError = prodErr
-
-			// Stop on production failure after retries
-			m.addError(fmt.Sprintf("Production database critical failure for ASIN %s: %v", attrs.ASIN, prodErr))
-			m.stopRequested = true
-			m.updateASINSyncStatus(attrs.ASIN, true, false,
-				fmt.Sprintf("Critical production DB error after 3 retries: %v", prodErr))
-			return false
 		}
 
 		successCount++
@@ -1037,19 +1061,21 @@ func (m *MasterSyncManager) storeSalesEstimateData(apiResponse *junglescout.Sale
 			m.logger.Printf("Failed to update staging sync status for ASIN %s: %v", attrs.ASIN, err)
 		}
 
-		// Update production status with retry
-		var prodErr error
-		for attempt := 1; attempt <= 3; attempt++ {
-			_, prodErr = m.productionClient.DB.Exec(buildSuccessStatusQuery(prodStatusTable), attrs.ASIN)
-			if prodErr == nil {
-				break
+		// Update production status with retry (skipped when staging-only)
+		if m.productionClient != nil {
+			var prodErr error
+			for attempt := 1; attempt <= 3; attempt++ {
+				_, prodErr = m.productionClient.DB.Exec(buildSuccessStatusQuery(prodStatusTable), attrs.ASIN)
+				if prodErr == nil {
+					break
+				}
+				if attempt < 3 {
+					time.Sleep(time.Duration(attempt) * time.Second)
+				}
 			}
-			if attempt < 3 {
-				time.Sleep(time.Duration(attempt) * time.Second)
+			if prodErr != nil {
+				m.logger.Printf("Failed to update production sync status for ASIN %s after 3 retries: %v", attrs.ASIN, prodErr)
 			}
-		}
-		if prodErr != nil {
-			m.logger.Printf("Failed to update production sync status for ASIN %s after 3 retries: %v", attrs.ASIN, prodErr)
 		}
 
 		m.logger.Printf("Sales data for ASIN %s: %d/%d succeeded, %d failed",
@@ -1069,7 +1095,9 @@ func (m *MasterSyncManager) storeSalesEstimateData(apiResponse *junglescout.Sale
 
 	errorMsg := fmt.Sprintf("Failed to sync all %d records. Last error: %v", len(attrs.Data), lastError)
 	m.stagingClient.DB.Exec(buildErrorStatusQuery(stagingStatusTable), attrs.ASIN, errorMsg)
-	m.productionClient.DB.Exec(buildErrorStatusQuery(prodStatusTable), attrs.ASIN, errorMsg)
+	if m.productionClient != nil {
+		m.productionClient.DB.Exec(buildErrorStatusQuery(prodStatusTable), attrs.ASIN, errorMsg)
+	}
 
 	m.logger.Printf("Failed to sync any sales data for ASIN %s", attrs.ASIN)
 	return false
@@ -1079,7 +1107,10 @@ func (m *MasterSyncManager) storeSalesEstimateData(apiResponse *junglescout.Sale
 // WRITE operation - staging first, then production with retry
 func (m *MasterSyncManager) updateASINSyncStatus(asin string, hasProductData, hasSalesData bool, errorMsg string) {
 	stagingStatusTable := m.stagingClient.TableName("jungle_scout_sync_status")
-	prodStatusTable := m.productionClient.TableName("jungle_scout_sync_status")
+	var prodStatusTable string
+	if m.productionClient != nil {
+		prodStatusTable = m.productionClient.TableName("jungle_scout_sync_status")
+	}
 
 	buildQuery := func(tableName string, hasError bool) string {
 		if hasError {
@@ -1115,7 +1146,10 @@ func (m *MasterSyncManager) updateASINSyncStatus(asin string, hasProductData, ha
 		m.logger.Printf("Failed to update staging sync status for ASIN %s: %v", asin, err)
 	}
 
-	// Step 2: Write to PRODUCTION with retry (3 attempts)
+	// Step 2: Write to PRODUCTION with retry (skipped when staging-only)
+	if m.productionClient == nil {
+		return
+	}
 	var prodErr error
 	for attempt := 1; attempt <= 3; attempt++ {
 		_, prodErr = m.productionClient.DB.Exec(buildQuery(prodStatusTable, hasError), args...)
@@ -1136,7 +1170,10 @@ func (m *MasterSyncManager) updateASINSyncStatus(asin string, hasProductData, ha
 // WRITE operation - staging first, then production with retry
 func (m *MasterSyncManager) updateBatchError(asins []string, errorMsg string) {
 	stagingStatusTable := m.stagingClient.TableName("jungle_scout_sync_status")
-	prodStatusTable := m.productionClient.TableName("jungle_scout_sync_status")
+	var prodStatusTable string
+	if m.productionClient != nil {
+		prodStatusTable = m.productionClient.TableName("jungle_scout_sync_status")
+	}
 
 	// Helper function to run batch update on a database
 	runBatchUpdate := func(db *sql.DB, tableName string, dbName string) error {
@@ -1174,7 +1211,10 @@ func (m *MasterSyncManager) updateBatchError(asins []string, errorMsg string) {
 		m.logger.Printf("Failed to update staging batch error: %v", err)
 	}
 
-	// Step 2: Write to PRODUCTION with retry (3 attempts)
+	// Step 2: Write to PRODUCTION with retry (skipped when staging-only)
+	if m.productionClient == nil {
+		return
+	}
 	var prodErr error
 	for attempt := 1; attempt <= 3; attempt++ {
 		prodErr = runBatchUpdate(m.productionClient.DB, prodStatusTable, "production")
@@ -1350,7 +1390,10 @@ func (m *MasterSyncManager) execOnBothDBs(query string, args ...interface{}) err
 		return fmt.Errorf("staging: %w", err)
 	}
 
-	// Write to production with retry (3 attempts)
+	// Write to production with retry (skipped when staging-only)
+	if m.productionClient == nil {
+		return nil
+	}
 	var prodErr error
 	for attempt := 1; attempt <= 3; attempt++ {
 		if _, prodErr = m.productionClient.DB.Exec(query, args...); prodErr == nil {
@@ -1468,7 +1511,7 @@ func (m *HourlySyncManager) RunHourlySync(marketplace string) {
 
 	// ==================== STEP 1: CLEANUP ====================
 	m.debugLog("---------- STEP 1: CLEANUP ----------")
-	m.debugLog("Removing ASINs with product_visibility=false from sync_status...")
+	m.debugLog("Removing ASINs with asin_visibility=false from sync_status...")
 	cleanedUp, err := m.cleanupSyncStatus()
 	if err != nil {
 		m.addHourlyError("db", fmt.Sprintf("Cleanup failed: %v", err))
@@ -1543,11 +1586,11 @@ func (m *HourlySyncManager) RunHourlySync(marketplace string) {
 	m.syncSelectedASINs(asinsToSync, marketplace)
 }
 
-// cleanupSyncStatus removes sync_status records for ASINs with product_visibility=false
+// cleanupSyncStatus removes sync_status records for ASINs with asin_visibility=false
 // NOTE: sync_status is staging-only, production writes are skipped
 func (m *HourlySyncManager) cleanupSyncStatus() (int, error) {
 	m.debugLog("[Cleanup] Getting product table name...")
-	productTableName, err := utils.GetTableName(m.stagingClient, "product")
+	productTableName, err := utils.GetTableName(m.stagingClient, "asin")
 	if err != nil {
 		m.debugLog("[Cleanup] ERROR: Failed to get product table name: %v", err)
 		return 0, fmt.Errorf("failed to get product table name: %w", err)
@@ -1562,7 +1605,7 @@ func (m *HourlySyncManager) cleanupSyncStatus() (int, error) {
 		WHERE asin NOT IN (
 			SELECT DISTINCT asin
 			FROM %s
-			WHERE product_visibility = true
+			WHERE asin_visibility = true
 			AND asin IS NOT NULL
 			AND asin != ''
 		)
@@ -1586,7 +1629,7 @@ func (m *HourlySyncManager) cleanupSyncStatus() (int, error) {
 // NOTE: sync_status is staging-only, production writes are skipped
 func (m *HourlySyncManager) addNewASINsToSyncStatus() (int, error) {
 	m.debugLog("[AddNew] Getting product table name...")
-	productTableName, err := utils.GetTableName(m.stagingClient, "product")
+	productTableName, err := utils.GetTableName(m.stagingClient, "asin")
 	if err != nil {
 		m.debugLog("[AddNew] ERROR: Failed to get product table name: %v", err)
 		return 0, fmt.Errorf("failed to get product table name: %w", err)
@@ -1598,7 +1641,7 @@ func (m *HourlySyncManager) addNewASINsToSyncStatus() (int, error) {
 		INSERT INTO %s (asin, has_product_data, has_sales_data, updated_at)
 		SELECT DISTINCT p.asin, false, false, CURRENT_TIMESTAMP
 		FROM %s p
-		WHERE p.product_visibility = true
+		WHERE p.asin_visibility = true
 		AND p.asin IS NOT NULL
 		AND p.asin != ''
 		AND p.asin NOT IN (SELECT asin FROM %s)
@@ -1923,7 +1966,10 @@ func (m *HourlySyncManager) storeHourlyProductData(apiResponse *junglescout.Prod
 
 	stagingProductTable := m.stagingClient.TableName("jungle_scout_product_data")
 	stagingStatusTable := m.stagingClient.TableName("jungle_scout_sync_status")
-	prodProductTable := m.productionClient.TableName("jungle_scout_product_data")
+	var prodProductTable string
+	if m.productionClient != nil {
+		prodProductTable = m.productionClient.TableName("jungle_scout_product_data")
+	}
 	reportDate := time.Now().Format("2006-01-02")
 
 	buildProductQuery := func(tableName string) string {
@@ -2039,21 +2085,24 @@ func (m *HourlySyncManager) storeHourlyProductData(apiResponse *junglescout.Prod
 		}
 		m.stagingClient.DB.Exec(buildStatusQuery(stagingStatusTable), asin, true, nil, time.Now())
 
-		// Production with retry (product_data only, sync_status is staging-only)
-		var prodErr error
-		for attempt := 1; attempt <= 3; attempt++ {
-			_, prodErr = m.productionClient.DB.Exec(buildProductQuery(prodProductTable), productArgs...)
-			if prodErr == nil {
-				break
+		// Production with retry (product_data only, sync_status is staging-only).
+		// Skipped entirely when running staging-only (no production client).
+		if m.productionClient != nil {
+			var prodErr error
+			for attempt := 1; attempt <= 3; attempt++ {
+				_, prodErr = m.productionClient.DB.Exec(buildProductQuery(prodProductTable), productArgs...)
+				if prodErr == nil {
+					break
+				}
+				if attempt < 3 {
+					time.Sleep(time.Duration(attempt) * time.Second)
+				}
 			}
-			if attempt < 3 {
-				time.Sleep(time.Duration(attempt) * time.Second)
-			}
-		}
 
-		if prodErr != nil {
-			m.addHourlyError("db", fmt.Sprintf("Production product store for %s failed: %v", asin, prodErr))
-			continue
+			if prodErr != nil {
+				m.addHourlyError("db", fmt.Sprintf("Production product store for %s failed: %v", asin, prodErr))
+				continue
+			}
 		}
 
 		successfulASINs = append(successfulASINs, asin)
@@ -2133,7 +2182,10 @@ func (m *HourlySyncManager) storeHourlySalesData(apiResponse *junglescout.SalesE
 
 	stagingSalesTable := m.stagingClient.TableName("jungle_scout_sales_estimate_data")
 	stagingStatusTable := m.stagingClient.TableName("jungle_scout_sync_status")
-	prodSalesTable := m.productionClient.TableName("jungle_scout_sales_estimate_data")
+	var prodSalesTable string
+	if m.productionClient != nil {
+		prodSalesTable = m.productionClient.TableName("jungle_scout_sales_estimate_data")
+	}
 
 	jsData := apiResponse.Data[0]
 	attrs := jsData.Attributes
@@ -2171,27 +2223,30 @@ func (m *HourlySyncManager) storeHourlySalesData(apiResponse *junglescout.SalesE
 	}
 	m.debugLog("[Sales] Staging: inserted %d data points for ASIN %s", stagingInserted, attrs.ASIN)
 
-	// Step 2: Batch insert to PRODUCTION with retry
-	var prodErr error
-	var prodInserted int
-	for attempt := 1; attempt <= 3; attempt++ {
-		prodInserted, prodErr = m.batchInsertSalesData(m.productionClient.DB, prodSalesTable, dataPoints, batchSize)
-		if prodErr == nil {
-			break
+	// Step 2: Batch insert to PRODUCTION with retry.
+	// Skipped entirely when running staging-only (no production client).
+	if m.productionClient != nil {
+		var prodErr error
+		var prodInserted int
+		for attempt := 1; attempt <= 3; attempt++ {
+			prodInserted, prodErr = m.batchInsertSalesData(m.productionClient.DB, prodSalesTable, dataPoints, batchSize)
+			if prodErr == nil {
+				break
+			}
+			m.debugLog("[Sales] Production batch insert attempt %d for %s failed: %v", attempt, attrs.ASIN, prodErr)
+			if attempt < 3 {
+				time.Sleep(time.Duration(attempt) * time.Second)
+			}
 		}
-		m.debugLog("[Sales] Production batch insert attempt %d for %s failed: %v", attempt, attrs.ASIN, prodErr)
-		if attempt < 3 {
-			time.Sleep(time.Duration(attempt) * time.Second)
-		}
-	}
 
-	if prodErr != nil {
-		m.addHourlyError("db", fmt.Sprintf("Production sales batch insert for %s failed after 3 retries: %v", attrs.ASIN, prodErr))
-		m.debugLog("[Sales] CRITICAL: Production batch insert failed for %s after 3 retries: %v", attrs.ASIN, prodErr)
-		m.stopRequested = true
-		return false
+		if prodErr != nil {
+			m.addHourlyError("db", fmt.Sprintf("Production sales batch insert for %s failed after 3 retries: %v", attrs.ASIN, prodErr))
+			m.debugLog("[Sales] CRITICAL: Production batch insert failed for %s after 3 retries: %v", attrs.ASIN, prodErr)
+			m.stopRequested = true
+			return false
+		}
+		m.debugLog("[Sales] Production: inserted %d data points for ASIN %s", prodInserted, attrs.ASIN)
 	}
-	m.debugLog("[Sales] Production: inserted %d data points for ASIN %s", prodInserted, attrs.ASIN)
 
 	// Update sync_status (staging only)
 	if stagingInserted > 0 {
