@@ -1,2 +1,4 @@
 .env
 .claude
+test-job-local.sh
+*.exe

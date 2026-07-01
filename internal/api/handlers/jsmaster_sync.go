@@ -335,11 +335,11 @@ func (m *MasterSyncManager) RunSync(marketplace string, syncMode string) {
 // fetchActiveASINs retrieves all ASINs from the active products table where visibility=true
 // READ operation - uses stagingClient only
 func (m *MasterSyncManager) fetchActiveASINs() ([]string, error) {
-	tableName, _ := utils.GetTableName(m.stagingClient, "product")
+	tableName, _ := utils.GetTableName(m.stagingClient, "asin")
 	query := fmt.Sprintf(`
 		SELECT DISTINCT asin
 		FROM %s
-		WHERE product_visibility = true AND asin IS NOT NULL AND asin != ''
+		WHERE asin_visibility = true AND asin IS NOT NULL AND asin != ''
 		ORDER BY asin
 	`, tableName)
 
@@ -1468,7 +1468,7 @@ func (m *HourlySyncManager) RunHourlySync(marketplace string) {
 
 	// ==================== STEP 1: CLEANUP ====================
 	m.debugLog("---------- STEP 1: CLEANUP ----------")
-	m.debugLog("Removing ASINs with product_visibility=false from sync_status...")
+	m.debugLog("Removing ASINs with asin_visibility=false from sync_status...")
 	cleanedUp, err := m.cleanupSyncStatus()
 	if err != nil {
 		m.addHourlyError("db", fmt.Sprintf("Cleanup failed: %v", err))
@@ -1543,11 +1543,11 @@ func (m *HourlySyncManager) RunHourlySync(marketplace string) {
 	m.syncSelectedASINs(asinsToSync, marketplace)
 }
 
-// cleanupSyncStatus removes sync_status records for ASINs with product_visibility=false
+// cleanupSyncStatus removes sync_status records for ASINs with asin_visibility=false
 // NOTE: sync_status is staging-only, production writes are skipped
 func (m *HourlySyncManager) cleanupSyncStatus() (int, error) {
 	m.debugLog("[Cleanup] Getting product table name...")
-	productTableName, err := utils.GetTableName(m.stagingClient, "product")
+	productTableName, err := utils.GetTableName(m.stagingClient, "asin")
 	if err != nil {
 		m.debugLog("[Cleanup] ERROR: Failed to get product table name: %v", err)
 		return 0, fmt.Errorf("failed to get product table name: %w", err)
@@ -1562,7 +1562,7 @@ func (m *HourlySyncManager) cleanupSyncStatus() (int, error) {
 		WHERE asin NOT IN (
 			SELECT DISTINCT asin
 			FROM %s
-			WHERE product_visibility = true
+			WHERE asin_visibility = true
 			AND asin IS NOT NULL
 			AND asin != ''
 		)
@@ -1586,7 +1586,7 @@ func (m *HourlySyncManager) cleanupSyncStatus() (int, error) {
 // NOTE: sync_status is staging-only, production writes are skipped
 func (m *HourlySyncManager) addNewASINsToSyncStatus() (int, error) {
 	m.debugLog("[AddNew] Getting product table name...")
-	productTableName, err := utils.GetTableName(m.stagingClient, "product")
+	productTableName, err := utils.GetTableName(m.stagingClient, "asin")
 	if err != nil {
 		m.debugLog("[AddNew] ERROR: Failed to get product table name: %v", err)
 		return 0, fmt.Errorf("failed to get product table name: %w", err)
@@ -1598,7 +1598,7 @@ func (m *HourlySyncManager) addNewASINsToSyncStatus() (int, error) {
 		INSERT INTO %s (asin, has_product_data, has_sales_data, updated_at)
 		SELECT DISTINCT p.asin, false, false, CURRENT_TIMESTAMP
 		FROM %s p
-		WHERE p.product_visibility = true
+		WHERE p.asin_visibility = true
 		AND p.asin IS NOT NULL
 		AND p.asin != ''
 		AND p.asin NOT IN (SELECT asin FROM %s)
