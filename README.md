@@ -354,9 +354,9 @@ curl -X POST "https://your-api.com/admin/hourly-sync?marketplace=us" \
 [HOURLY_SYNC] Marketplace: us
 [HOURLY_SYNC] Debug mode: true
 [HOURLY_SYNC] ---------- STEP 1: CLEANUP ----------
-[HOURLY_SYNC] Removing ASINs with product_visibility=false from sync_status...
+[HOURLY_SYNC] Removing ASINs with asin_visibility=false from sync_status...
 [HOURLY_SYNC] [Cleanup] Getting product table name...
-[HOURLY_SYNC] [Cleanup] Product table: dev_az_product
+[HOURLY_SYNC] [Cleanup] Product table: dev_az_asin_1
 [HOURLY_SYNC] [Cleanup] Staging sync table: dev_az_jungle_scout_sync_status
 [HOURLY_SYNC] [Cleanup] Executing DELETE on staging...
 [HOURLY_SYNC] [Cleanup] Staging: 0 rows deleted
@@ -451,7 +451,7 @@ The hourly sync is designed for cloud scheduler execution, processing up to **10
                               v
 +------------------------------------------------------------------+
 | STEP 1: CLEANUP                                                   |
-| Delete sync_status records for ASINs with product_visibility=false|
+| Delete sync_status records for ASINs with asin_visibility=false  |
 | Result: CleanedUpASINs count                                      |
 +------------------------------------------------------------------+
                               |
@@ -542,7 +542,80 @@ The hourly sync is designed for cloud scheduler execution, processing up to **10
 
 ## Master Sync Flow
 
-Manual full sync of all ASINs with `product_visibility = true`.
+Manual full sync of all **parent** ASINs covering visible children.
+
+### Data source (vx-3 schema)
+
+Two tables decide what gets fetched:
+
+1. The **active ASIN table**, whose real name is resolved at runtime from the
+   `{prefix}frontend_asin` meta table (it holds a single `table_name` value —
+   currently `dev_az_asin_1`). Supplies `asin` and the `asin_visibility` boolean.
+2. The **parent/child mapping**, `{prefix}parent_asin`
+   (`geo_id, parent_asin, child_asin, is_primary, effdtm, is_available, is_fod`,
+   unique on `(parent_asin, child_asin)` and on `(child_asin, geo_id)`).
+
+> Migrated from the vx-2 schema, which used a `{prefix}frontend_product` meta table
+> and a `product_visibility` column. vx-3 renamed these to `frontend_asin` /
+> `asin_visibility`; `asin_visibility = true` is the 1:1 equivalent of the old
+> `product_visibility = true`.
+
+### Parent-only fetch + child fan-out
+
+The sync calls JungleScout for **parent ASINs only**. Each parent row written to
+`jungle_scout_product_data` / `jungle_scout_sales_estimate_data` is then copied onto
+every visible child of that parent. Children never enter `jungle_scout_sync_status`,
+so they never consume an API call. Implementation: `internal/api/handlers/jsparent_fanout.go`.
+
+The set of ASINs fetched (`parentASINSourceSQL`) is:
+
+| Branch | Rule | Count (staging, Aug 2026) |
+|---|---|---|
+| Parents | every `parent_asin` with ≥1 visible child | 70,975 |
+| Orphans | visible ASINs with no mapping row, treated as their own parent | 1,988 |
+| **Total fetched** | | **72,928** (vs 209,543 individually → 66% fewer calls) |
+
+Note that a parent whose own `asin_visibility` is `false` is still fetched (16,036 of
+them), because its visible children depend on its data.
+
+**All data columns are copied, including the ones that genuinely differ between
+variants** — price, reviews, rating, `product_rank`, `buy_box_owner`,
+`number_of_sellers`, `approximate_30_day_revenue/units`, `estimated_units_sold`,
+`last_known_price`. This is intentional. Two consequences:
+
+- A child's price/reviews/rating reflect the **parent** listing, not the variant.
+- A parent's `estimated_units_sold` is the **aggregate across all its variants**, so
+  summing units across children multiplies the true total by the number of children.
+
+Only five columns are not copied verbatim, because they identify the row rather than
+describe the product: `asin` (the child), `parent_asin` (lineage), `is_variant`
+(`true`), `is_parent` (`false`), `created_at` (now).
+
+Two edge cases the mapping forces:
+
+- **Self-referencing rows** (`parent_asin = child_asin`, 85,354 of them) are standalone
+  products. Excluded from the fan-out — the parent fetch already wrote that row.
+- **Chained ASINs** (471) are both a parent of visible children *and* a child of another
+  parent. They are fetched directly, and the fan-out skips them (`notItselfAParent`), so
+  real fetched data is never clobbered by a copy.
+
+**Geo:** the mapping carries `geo_id`, but the sync has no geo concept (matching
+pre-existing behaviour); today the mapping is 100% `geo_id='US'`. Onboarding a second
+geo requires adding a `geo_id` filter to the fan-out and to the ASIN selection,
+otherwise children from one geo will be fed from another geo's parent.
+
+Tests in `jsparent_fanout_test.go` run the real SQL against staging inside
+rolled-back transactions; they assert coverage (no visible ASIN is left without data),
+the no-clobber invariant, and that child rows match the parent column-for-column.
+They skip when `DB_STAGING_HOST` is unset.
+
+### Staging-only mode
+
+When `DB_PROD_HOST` is empty, the job and server start **staging-only**: the
+production client is `nil` and every production write (product_data,
+sales_estimate_data, api_usage) is skipped. Supply the `DB_PROD_*` vars with a
+**write-capable** production user to re-enable the dual-write. (vx-3 prod is
+read-only, so it runs staging-only.)
 
 ### Sync Modes
 
@@ -553,7 +626,7 @@ Manual full sync of all ASINs with `product_visibility = true`.
 
 ### Flow
 
-1. Fetch all ASINs from product table where `product_visibility = true`
+1. Fetch all ASINs from the active ASIN table where `asin_visibility = true`
 2. Initialize/reset sync_status entries
 3. Sync product data in batches of 100
 4. Sync sales data for ASINs with successful product data
@@ -1046,7 +1119,9 @@ gcloud logging read "resource.type=cloud_run_job AND resource.labels.job_name=ju
 | Issue | Cause | Solution |
 |-------|-------|----------|
 | Discord notification not sending | Webhook URL invalid | Test with curl, check URL |
-| Sync stuck at 0 ASINs | No visible products | Check product_visibility in product table |
+| Sync stuck at 0 ASINs | No visible ASINs | Check asin_visibility in the active ASIN table (resolved via frontend_asin) |
+| Child ASINs have no data | Missing row in `{prefix}parent_asin` | Children are only filled by the fan-out; an ASIN with no mapping row is fetched directly as an orphan, so check it is `asin_visibility = true` |
+| Child data looks stale/wrong vs Amazon | Expected — copied from the parent | Child price/reviews/rank are the parent's values by design; see Parent-only fetch + child fan-out |
 | All ASINs failing | Database connection | Check DB credentials and connectivity |
 | "Product not found" for all | Invalid marketplace | Verify marketplace parameter |
 | API rate limiting | Too many requests | Reduce concurrency, add delays |

@@ -33,27 +33,35 @@ func main() {
 	}
 	log.Println("Staging PostgreSQL connectivity test passed!")
 
-	// Initialize Production PostgreSQL client
-	log.Println("Initializing Production PostgreSQL client...")
-	productionClient, err := database.InitPostgreSQL(
-		os.Getenv("DB_PROD_HOST"),
-		os.Getenv("DB_PROD_PORT"),
-		os.Getenv("DB_PROD_USER"),
-		os.Getenv("DB_PROD_PASS"),
-		os.Getenv("DB_PROD_NAME"),
-		os.Getenv("DB_PROD_TABLE_PREFIX"),
-	)
-	if err != nil {
-		log.Fatalf("Failed to initialize Production PostgreSQL client: %v", err)
-	}
-	defer productionClient.Close()
+	// Initialize Production PostgreSQL client (optional).
+	// vx-3 prod is read-only, so the server runs STAGING-ONLY when prod creds are
+	// absent. When DB_PROD_HOST is empty, productionClient stays nil and every
+	// production write is skipped downstream.
+	var productionClient *database.PostgreSQLClient
+	if os.Getenv("DB_PROD_HOST") != "" {
+		log.Println("Initializing Production PostgreSQL client...")
+		productionClient, err = database.InitPostgreSQL(
+			os.Getenv("DB_PROD_HOST"),
+			os.Getenv("DB_PROD_PORT"),
+			os.Getenv("DB_PROD_USER"),
+			os.Getenv("DB_PROD_PASS"),
+			os.Getenv("DB_PROD_NAME"),
+			os.Getenv("DB_PROD_TABLE_PREFIX"),
+		)
+		if err != nil {
+			log.Fatalf("Failed to initialize Production PostgreSQL client: %v", err)
+		}
+		defer productionClient.Close()
 
-	// Test Production connectivity
-	log.Println("Testing Production PostgreSQL connectivity...")
-	if err := productionClient.TestConnectivity(); err != nil {
-		log.Fatalf("Production PostgreSQL connectivity test failed: %v", err)
+		// Test Production connectivity
+		log.Println("Testing Production PostgreSQL connectivity...")
+		if err := productionClient.TestConnectivity(); err != nil {
+			log.Fatalf("Production PostgreSQL connectivity test failed: %v", err)
+		}
+		log.Println("Production PostgreSQL connectivity test passed!")
+	} else {
+		log.Println("DB_PROD_HOST not set — running STAGING-ONLY (production writes disabled)")
 	}
-	log.Println("Production PostgreSQL connectivity test passed!")
 
 	// Set up port with default value
 	port := os.Getenv("PORT")

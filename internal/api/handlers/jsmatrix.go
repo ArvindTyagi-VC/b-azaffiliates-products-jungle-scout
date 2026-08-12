@@ -334,28 +334,30 @@ func SyncJungleScoutSalesEstimateData(stagingClient, productionClient *database.
 		}
 		log.Printf("Staging sync complete: %d inserted, %d updated", stagingInserted, stagingUpdated)
 
-		// Step 2: Write to PRODUCTION with retry (3 attempts)
+		// Step 2: Write to PRODUCTION with retry (skipped when staging-only)
 		var prodInserted, prodUpdated int
-		var prodErr error
-		for attempt := 1; attempt <= 3; attempt++ {
-			prodInserted, prodUpdated, prodErr = syncToDatabase(productionClient, "production")
-			if prodErr == nil {
-				break
+		if productionClient != nil {
+			var prodErr error
+			for attempt := 1; attempt <= 3; attempt++ {
+				prodInserted, prodUpdated, prodErr = syncToDatabase(productionClient, "production")
+				if prodErr == nil {
+					break
+				}
+				log.Printf("Production sync attempt %d failed: %v", attempt, prodErr)
+				if attempt < 3 {
+					time.Sleep(time.Duration(attempt) * time.Second)
+				}
 			}
-			log.Printf("Production sync attempt %d failed: %v", attempt, prodErr)
-			if attempt < 3 {
-				time.Sleep(time.Duration(attempt) * time.Second)
-			}
-		}
 
-		if prodErr != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error":           fmt.Sprintf("Production sync failed after 3 retries: %v", prodErr),
-				"staging_success": true,
-				"staging_inserted": stagingInserted,
-				"staging_updated":  stagingUpdated,
-			})
-			return
+			if prodErr != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"error":           fmt.Sprintf("Production sync failed after 3 retries: %v", prodErr),
+					"staging_success": true,
+					"staging_inserted": stagingInserted,
+					"staging_updated":  stagingUpdated,
+				})
+				return
+			}
 		}
 
 		response := gin.H{
@@ -666,28 +668,30 @@ func SyncJungleScoutProductDatabaseData(stagingClient, productionClient *databas
 		}
 		log.Printf("Staging product sync complete: %d inserted, %d updated", stagingInserted, stagingUpdated)
 
-		// Step 2: Write to PRODUCTION with retry (3 attempts)
+		// Step 2: Write to PRODUCTION with retry (skipped when staging-only)
 		var prodInserted, prodUpdated int
-		var prodErr error
-		for attempt := 1; attempt <= 3; attempt++ {
-			prodInserted, prodUpdated, prodErr = syncToDatabase(productionClient, "production")
-			if prodErr == nil {
-				break
+		if productionClient != nil {
+			var prodErr error
+			for attempt := 1; attempt <= 3; attempt++ {
+				prodInserted, prodUpdated, prodErr = syncToDatabase(productionClient, "production")
+				if prodErr == nil {
+					break
+				}
+				log.Printf("Production product sync attempt %d failed: %v", attempt, prodErr)
+				if attempt < 3 {
+					time.Sleep(time.Duration(attempt) * time.Second)
+				}
 			}
-			log.Printf("Production product sync attempt %d failed: %v", attempt, prodErr)
-			if attempt < 3 {
-				time.Sleep(time.Duration(attempt) * time.Second)
-			}
-		}
 
-		if prodErr != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error":            fmt.Sprintf("Production sync failed after 3 retries: %v", prodErr),
-				"staging_success":  true,
-				"staging_inserted": stagingInserted,
-				"staging_updated":  stagingUpdated,
-			})
-			return
+			if prodErr != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"error":            fmt.Sprintf("Production sync failed after 3 retries: %v", prodErr),
+					"staging_success":  true,
+					"staging_inserted": stagingInserted,
+					"staging_updated":  stagingUpdated,
+				})
+				return
+			}
 		}
 
 		c.JSON(http.StatusOK, gin.H{

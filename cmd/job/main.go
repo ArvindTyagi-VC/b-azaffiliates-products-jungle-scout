@@ -41,26 +41,34 @@ func main() {
 	}
 	log.Println("Staging PostgreSQL connectivity test passed")
 
-	// Initialize Production PostgreSQL client
-	log.Println("Initializing Production PostgreSQL client...")
-	productionClient, err := database.InitPostgreSQL(
-		os.Getenv("DB_PROD_HOST"),
-		os.Getenv("DB_PROD_PORT"),
-		os.Getenv("DB_PROD_USER"),
-		os.Getenv("DB_PROD_PASS"),
-		os.Getenv("DB_PROD_NAME"),
-		os.Getenv("DB_PROD_TABLE_PREFIX"),
-	)
-	if err != nil {
-		log.Fatalf("FATAL: Failed to initialize Production PostgreSQL client: %v", err)
-	}
-	defer productionClient.Close()
+	// Initialize Production PostgreSQL client (optional).
+	// vx-3 prod is read-only, so the sync runs STAGING-ONLY when prod creds are
+	// absent. When DB_PROD_HOST is empty, productionClient stays nil and every
+	// production write is skipped downstream.
+	var productionClient *database.PostgreSQLClient
+	if os.Getenv("DB_PROD_HOST") != "" {
+		log.Println("Initializing Production PostgreSQL client...")
+		productionClient, err = database.InitPostgreSQL(
+			os.Getenv("DB_PROD_HOST"),
+			os.Getenv("DB_PROD_PORT"),
+			os.Getenv("DB_PROD_USER"),
+			os.Getenv("DB_PROD_PASS"),
+			os.Getenv("DB_PROD_NAME"),
+			os.Getenv("DB_PROD_TABLE_PREFIX"),
+		)
+		if err != nil {
+			log.Fatalf("FATAL: Failed to initialize Production PostgreSQL client: %v", err)
+		}
+		defer productionClient.Close()
 
-	// Test Production connectivity
-	if err := productionClient.TestConnectivity(); err != nil {
-		log.Fatalf("FATAL: Production PostgreSQL connectivity test failed: %v", err)
+		// Test Production connectivity
+		if err := productionClient.TestConnectivity(); err != nil {
+			log.Fatalf("FATAL: Production PostgreSQL connectivity test failed: %v", err)
+		}
+		log.Println("Production PostgreSQL connectivity test passed")
+	} else {
+		log.Println("DB_PROD_HOST not set — running STAGING-ONLY (production writes disabled)")
 	}
-	log.Println("Production PostgreSQL connectivity test passed")
 
 	// Build the JungleScout API usage recorder (dual-write).
 	apiUsageRecorder := junglescout.NewDBAPIUsageRecorder(stagingClient, productionClient)
