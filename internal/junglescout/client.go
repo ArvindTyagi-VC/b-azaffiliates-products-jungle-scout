@@ -58,10 +58,10 @@ func NewClientWithRateLimit(maxRequestsPerSecond float64) *Client {
 }
 
 // doRequest performs an HTTP request with rate limiting and retry logic.
-// endpointKey is the JungleScout endpoint name (e.g. "product_database_query")
-// recorded for usage tracking — one record per HTTP roundtrip that returned a
-// response, since JS bills per request including 429s and other failures.
-func (c *Client) doRequest(method, endpoint, endpointKey string, body interface{}) (*http.Response, error) {
+// Transport only — recording API usage is the caller's responsibility, since
+// only the caller can decide whether the response qualifies as a successful
+// data-bearing call.
+func (c *Client) doRequest(method, endpoint string, body interface{}) (*http.Response, error) {
 	maxRetries := 3
 	var lastError error
 
@@ -94,11 +94,6 @@ func (c *Client) doRequest(method, endpoint, endpointKey string, body interface{
 			lastError = err
 			time.Sleep(time.Duration(attempt+1) * time.Second) // Exponential backoff
 			continue
-		}
-
-		// JS server saw the request — count it before any further branching.
-		if c.recorder != nil {
-			c.recorder.Record(endpointKey)
 		}
 
 		// Handle rate limiting (429)
@@ -155,7 +150,7 @@ func (c *Client) FetchProductData(asins []string, marketplace string) (*ProductA
 
 	endpoint := fmt.Sprintf("%s/product_database_query?marketplace=%s&sort=name&page[size]=100", c.baseURL, marketplace)
 
-	resp, err := c.doRequest("POST", endpoint, EndpointProductDatabaseQuery, requestBody)
+	resp, err := c.doRequest("POST", endpoint, requestBody)
 	if err != nil {
 		return nil, err
 	}
@@ -175,6 +170,10 @@ func (c *Client) FetchProductData(asins []string, marketplace string) (*ProductA
 
 	if err := json.Unmarshal(bodyBytes, &apiResponse); err != nil {
 		return nil, fmt.Errorf("failed to parse API response: %w", err)
+	}
+
+	if c.recorder != nil && len(apiResponse.Data) > 0 {
+		c.recorder.Record(EndpointProductDatabaseQuery)
 	}
 
 	return &apiResponse, nil
@@ -206,7 +205,7 @@ func (c *Client) FetchSalesEstimateData(asin, marketplace, startDate, endDate st
 		c.baseURL, marketplace, asin, startDate, endDate,
 	)
 
-	resp, err := c.doRequest("GET", endpoint, EndpointSalesEstimatesQuery, nil)
+	resp, err := c.doRequest("GET", endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -226,6 +225,10 @@ func (c *Client) FetchSalesEstimateData(asin, marketplace, startDate, endDate st
 	var apiResponse SalesEstimateAPIResponse
 	if err := json.Unmarshal(bodyBytes, &apiResponse); err != nil {
 		return nil, fmt.Errorf("failed to parse API response: %w", err)
+	}
+
+	if c.recorder != nil && len(apiResponse.Data) > 0 {
+		c.recorder.Record(EndpointSalesEstimatesQuery)
 	}
 
 	return &apiResponse, nil
