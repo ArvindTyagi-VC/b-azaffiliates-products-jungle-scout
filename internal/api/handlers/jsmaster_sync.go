@@ -15,7 +15,6 @@ import (
 
 	"azaffiliates/internal/database"
 	"azaffiliates/internal/junglescout"
-	"azaffiliates/internal/utils"
 
 	"github.com/gin-gonic/gin"
 )
@@ -51,6 +50,12 @@ type MasterSyncManager struct {
 	stopRequested    bool   // Flag to stop the sync process
 	criticalErrors   int    // Count of critical errors
 	apiCallCount     int    // Simple counter for API calls
+
+	// Table names used by the parent -> child fan-out, resolved once per run so
+	// the frontend_asin lookup is not repeated per ASIN. prodTables stays zero
+	// when running staging-only.
+	stagingTables syncTables
+	prodTables    syncTables
 }
 
 var (
@@ -128,6 +133,30 @@ type HourlySyncManager struct {
 	stopRequested    bool
 	apiCallCount     int
 	debugMode        bool // When true, prints verbose logs
+
+	// Table names used by the parent -> child fan-out, resolved once per run.
+	// prodTables stays zero when running staging-only.
+	stagingTables syncTables
+	prodTables    syncTables
+}
+
+// resolveFanOutTables resolves and caches the table names used by the parent ->
+// child fan-out for both databases. Called once at the start of a run.
+func (m *HourlySyncManager) resolveFanOutTables() error {
+	tables, err := resolveSyncTables(m.stagingClient)
+	if err != nil {
+		return fmt.Errorf("staging: %w", err)
+	}
+	m.stagingTables = tables
+
+	if m.productionClient != nil {
+		prodTables, err := resolveSyncTables(m.productionClient)
+		if err != nil {
+			return fmt.Errorf("production: %w", err)
+		}
+		m.prodTables = prodTables
+	}
+	return nil
 }
 
 // debugLog prints a log message only if debug mode is enabled
@@ -303,11 +332,18 @@ func (m *MasterSyncManager) RunSync(marketplace string, syncMode string) {
 		m.sendDiscordNotification(syncMode)
 	}()
 
-	// Step 1: Fetch all ASINs from active products table where visibility=true
-	asins, err := m.fetchActiveASINs()
+	// Step 0: Resolve the table names the parent/child fan-out needs, once per run
+	if err := m.resolveFanOutTables(); err != nil {
+		m.addError(fmt.Sprintf("Failed to resolve fan-out tables: %v", err))
+		m.logger.Printf("Error resolving fan-out tables: %v", err)
+		return
+	}
+
+	// Step 1: Fetch the PARENT ASINs to sync (children are filled in by fan-out)
+	asins, err := m.fetchParentASINsToSync()
 	if err != nil {
-		m.addError(fmt.Sprintf("Failed to fetch ASINs: %v", err))
-		m.logger.Printf("Error fetching ASINs: %v", err)
+		m.addError(fmt.Sprintf("Failed to fetch parent ASINs: %v", err))
+		m.logger.Printf("Error fetching parent ASINs: %v", err)
 		return
 	}
 
@@ -316,7 +352,7 @@ func (m *MasterSyncManager) RunSync(marketplace string, syncMode string) {
 	m.status.TotalBatches = (len(asins) + 99) / 100 // Calculate total batches (100 ASINs per batch)
 	m.statusMutex.Unlock()
 
-	m.logger.Printf("Found %d ASINs to sync", len(asins))
+	m.logger.Printf("Found %d parent ASINs to sync (children are copied from their parent)", len(asins))
 
 	// Step 2: Initialize or update asin_sync_status table
 	if err := m.initializeASINSyncStatus(asins, syncMode); err != nil {
@@ -332,20 +368,39 @@ func (m *MasterSyncManager) RunSync(marketplace string, syncMode string) {
 	m.syncSalesEstimateData(marketplace)
 }
 
-// fetchActiveASINs retrieves all ASINs from the active products table where visibility=true
+// resolveFanOutTables resolves and caches the table names used by the parent ->
+// child fan-out for both databases. Called once at the start of a run.
+func (m *MasterSyncManager) resolveFanOutTables() error {
+	tables, err := resolveSyncTables(m.stagingClient)
+	if err != nil {
+		return fmt.Errorf("staging: %w", err)
+	}
+	m.stagingTables = tables
+
+	if m.productionClient != nil {
+		prodTables, err := resolveSyncTables(m.productionClient)
+		if err != nil {
+			return fmt.Errorf("production: %w", err)
+		}
+		m.prodTables = prodTables
+	}
+	return nil
+}
+
+// fetchParentASINsToSync retrieves the PARENT ASINs the sync must fetch from
+// JungleScout: every parent with at least one visible child, plus visible ASINs
+// that have no mapping row (treated as their own parent). Children are never
+// fetched directly — their data is copied from the parent by the fan-out.
 // READ operation - uses stagingClient only
-func (m *MasterSyncManager) fetchActiveASINs() ([]string, error) {
-	tableName, _ := utils.GetTableName(m.stagingClient, "asin")
+func (m *MasterSyncManager) fetchParentASINsToSync() ([]string, error) {
 	query := fmt.Sprintf(`
-		SELECT DISTINCT asin
-		FROM %s
-		WHERE asin_visibility = true AND asin IS NOT NULL AND asin != ''
+		SELECT asin FROM (%s) src
 		ORDER BY asin
-	`, tableName)
+	`, parentASINSourceSQL(m.stagingTables))
 
 	rows, err := m.stagingClient.DB.Query(query)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query ASINs: %w", err)
+		return nil, fmt.Errorf("failed to query parent ASINs: %w", err)
 	}
 	defer rows.Close()
 
@@ -781,6 +836,23 @@ func (m *MasterSyncManager) storeProductData(apiResponse *junglescout.ProductAPI
 			}
 		}
 
+		// Step 3: Copy this parent's row onto every visible child.
+		// A fan-out failure is NOT critical: the parent row is already stored and
+		// the API call is not wasted, so log it and keep going.
+		if childRows, fanErr := fanOutProductRow(m.stagingClient, m.stagingTables, asin, reportDate); fanErr != nil {
+			m.logger.Printf("WARNING: staging %v", fanErr)
+			m.addError(fmt.Sprintf("Staging product fan-out failed for parent %s: %v", asin, fanErr))
+		} else if childRows > 0 {
+			m.logger.Printf("Copied product data for parent %s to %d child ASINs", asin, childRows)
+		}
+
+		if m.productionClient != nil {
+			if _, fanErr := fanOutProductRow(m.productionClient, m.prodTables, asin, reportDate); fanErr != nil {
+				m.logger.Printf("WARNING: production %v", fanErr)
+				m.addError(fmt.Sprintf("Production product fan-out failed for parent %s: %v", asin, fanErr))
+			}
+		}
+
 		successCount++
 	}
 
@@ -1041,6 +1113,24 @@ func (m *MasterSyncManager) storeSalesEstimateData(apiResponse *junglescout.Sale
 		}
 
 		successCount++
+	}
+
+	// Copy every sales row of this parent onto its visible children.
+	// Non-critical: the parent rows are stored and the API call is not wasted.
+	if successCount > 0 {
+		if childRows, fanErr := fanOutSalesRows(m.stagingClient, m.stagingTables, attrs.ASIN, marketplace); fanErr != nil {
+			m.logger.Printf("WARNING: staging %v", fanErr)
+			m.addError(fmt.Sprintf("Staging sales fan-out failed for parent %s: %v", attrs.ASIN, fanErr))
+		} else if childRows > 0 {
+			m.logger.Printf("Copied %d sales rows from parent %s to its child ASINs", childRows, attrs.ASIN)
+		}
+
+		if m.productionClient != nil {
+			if _, fanErr := fanOutSalesRows(m.productionClient, m.prodTables, attrs.ASIN, marketplace); fanErr != nil {
+				m.logger.Printf("WARNING: production %v", fanErr)
+				m.addError(fmt.Sprintf("Production sales fan-out failed for parent %s: %v", attrs.ASIN, fanErr))
+			}
+		}
 	}
 
 	// Update sync status based on results (dual-write)
@@ -1509,9 +1599,22 @@ func (m *HourlySyncManager) RunHourlySync(marketplace string) {
 		m.debugLog("Discord notification sent")
 	}()
 
+	// ==================== STEP 0: RESOLVE TABLES ====================
+	m.debugLog("---------- STEP 0: RESOLVE TABLES ----------")
+	if err := m.resolveFanOutTables(); err != nil {
+		m.addHourlyError("db", fmt.Sprintf("Failed to resolve fan-out tables: %v", err))
+		log.Printf("[HOURLY_SYNC] CRITICAL: Failed to resolve fan-out tables: %v", err)
+		m.statusMutex.Lock()
+		m.status.StoppedEarly = true
+		m.status.StopReason = "Failed to resolve fan-out tables"
+		m.statusMutex.Unlock()
+		return
+	}
+	m.debugLog("Tables resolved: asin=%s mapping=%s", m.stagingTables.asin, m.stagingTables.mapping)
+
 	// ==================== STEP 1: CLEANUP ====================
 	m.debugLog("---------- STEP 1: CLEANUP ----------")
-	m.debugLog("Removing ASINs with asin_visibility=false from sync_status...")
+	m.debugLog("Removing ASINs that are no longer parents-to-sync from sync_status...")
 	cleanedUp, err := m.cleanupSyncStatus()
 	if err != nil {
 		m.addHourlyError("db", fmt.Sprintf("Cleanup failed: %v", err))
@@ -1589,27 +1692,11 @@ func (m *HourlySyncManager) RunHourlySync(marketplace string) {
 // cleanupSyncStatus removes sync_status records for ASINs with asin_visibility=false
 // NOTE: sync_status is staging-only, production writes are skipped
 func (m *HourlySyncManager) cleanupSyncStatus() (int, error) {
-	m.debugLog("[Cleanup] Getting product table name...")
-	productTableName, err := utils.GetTableName(m.stagingClient, "asin")
-	if err != nil {
-		m.debugLog("[Cleanup] ERROR: Failed to get product table name: %v", err)
-		return 0, fmt.Errorf("failed to get product table name: %w", err)
-	}
-	m.debugLog("[Cleanup] Product table: %s", productTableName)
-
 	stagingSyncTable := m.stagingClient.TableName("jungle_scout_sync_status")
 	m.debugLog("[Cleanup] Staging sync table: %s", stagingSyncTable)
+	m.debugLog("[Cleanup] ASIN table: %s, mapping table: %s", m.stagingTables.asin, m.stagingTables.mapping)
 
-	deleteQuery := fmt.Sprintf(`
-		DELETE FROM %s
-		WHERE asin NOT IN (
-			SELECT DISTINCT asin
-			FROM %s
-			WHERE asin_visibility = true
-			AND asin IS NOT NULL
-			AND asin != ''
-		)
-	`, stagingSyncTable, productTableName)
+	deleteQuery := syncStatusCleanupQuery(stagingSyncTable, m.stagingTables)
 
 	m.debugLog("[Cleanup] Executing DELETE on staging...")
 	result, err := m.stagingClient.DB.Exec(deleteQuery)
@@ -1628,26 +1715,11 @@ func (m *HourlySyncManager) cleanupSyncStatus() (int, error) {
 // addNewASINsToSyncStatus inserts ASINs that exist in product table but not in sync_status
 // NOTE: sync_status is staging-only, production writes are skipped
 func (m *HourlySyncManager) addNewASINsToSyncStatus() (int, error) {
-	m.debugLog("[AddNew] Getting product table name...")
-	productTableName, err := utils.GetTableName(m.stagingClient, "asin")
-	if err != nil {
-		m.debugLog("[AddNew] ERROR: Failed to get product table name: %v", err)
-		return 0, fmt.Errorf("failed to get product table name: %w", err)
-	}
-
 	stagingSyncTable := m.stagingClient.TableName("jungle_scout_sync_status")
 
-	insertQuery := fmt.Sprintf(`
-		INSERT INTO %s (asin, has_product_data, has_sales_data, updated_at)
-		SELECT DISTINCT p.asin, false, false, CURRENT_TIMESTAMP
-		FROM %s p
-		WHERE p.asin_visibility = true
-		AND p.asin IS NOT NULL
-		AND p.asin != ''
-		AND p.asin NOT IN (SELECT asin FROM %s)
-	`, stagingSyncTable, productTableName, stagingSyncTable)
+	insertQuery := syncStatusAddNewQuery(stagingSyncTable, m.stagingTables)
 
-	m.debugLog("[AddNew] Inserting new ASINs into staging sync_status...")
+	m.debugLog("[AddNew] Inserting new parent ASINs into staging sync_status...")
 	result, err := m.stagingClient.DB.Exec(insertQuery)
 	if err != nil {
 		m.debugLog("[AddNew] ERROR: Staging insert failed: %v", err)
@@ -2105,6 +2177,22 @@ func (m *HourlySyncManager) storeHourlyProductData(apiResponse *junglescout.Prod
 			}
 		}
 
+		// Copy this parent's row onto every visible child. Non-critical: the
+		// parent row is stored and the API call is not wasted.
+		if childRows, fanErr := fanOutProductRow(m.stagingClient, m.stagingTables, asin, reportDate); fanErr != nil {
+			m.addHourlyError("db", fmt.Sprintf("Staging product fan-out for %s failed: %v", asin, fanErr))
+			m.debugLog("[Product] WARNING: staging %v", fanErr)
+		} else {
+			m.debugLog("[Product] Copied parent %s to %d child ASINs", asin, childRows)
+		}
+
+		if m.productionClient != nil {
+			if _, fanErr := fanOutProductRow(m.productionClient, m.prodTables, asin, reportDate); fanErr != nil {
+				m.addHourlyError("db", fmt.Sprintf("Production product fan-out for %s failed: %v", asin, fanErr))
+				m.debugLog("[Product] WARNING: production %v", fanErr)
+			}
+		}
+
 		successfulASINs = append(successfulASINs, asin)
 	}
 
@@ -2246,6 +2334,23 @@ func (m *HourlySyncManager) storeHourlySalesData(apiResponse *junglescout.SalesE
 			return false
 		}
 		m.debugLog("[Sales] Production: inserted %d data points for ASIN %s", prodInserted, attrs.ASIN)
+	}
+
+	// Copy this parent's sales rows onto its visible children. Non-critical.
+	if stagingInserted > 0 {
+		if childRows, fanErr := fanOutSalesRows(m.stagingClient, m.stagingTables, attrs.ASIN, marketplace); fanErr != nil {
+			m.addHourlyError("db", fmt.Sprintf("Staging sales fan-out for %s failed: %v", attrs.ASIN, fanErr))
+			m.debugLog("[Sales] WARNING: staging %v", fanErr)
+		} else {
+			m.debugLog("[Sales] Copied %d sales rows from parent %s to its children", childRows, attrs.ASIN)
+		}
+
+		if m.productionClient != nil {
+			if _, fanErr := fanOutSalesRows(m.productionClient, m.prodTables, attrs.ASIN, marketplace); fanErr != nil {
+				m.addHourlyError("db", fmt.Sprintf("Production sales fan-out for %s failed: %v", attrs.ASIN, fanErr))
+				m.debugLog("[Sales] WARNING: production %v", fanErr)
+			}
+		}
 	}
 
 	// Update sync_status (staging only)
