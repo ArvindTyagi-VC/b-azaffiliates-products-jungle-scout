@@ -104,11 +104,15 @@ var (
 	// million-ASIN job. A run that reaches it is an incident, not a full sync —
 	// selectASINsToSync logs loudly and the job exits non-zero.
 	//
-	// Sizing: measured on vx-3-staging on 2026-08-19, the parent set is 107,032
-	// (296,365 visible ASINs). The default below leaves roughly 40% headroom. This
-	// value has to be revisited as the catalogue grows: once the parent set passes
-	// the cap, EVERY run truncates and reports failure. Check it against
-	// parentASINSourceSQL whenever the catalogue changes materially.
+	// Sizing: RE-MEASURED on vx-3-staging 2026-08-19 after the parent source became
+	// "every distinct parent_asin in the mapping table" (no asin_visibility filter,
+	// no join to the active ASIN table): the parent set is 124,845, up from the
+	// 107,032 the earlier filtered query returned. The 150,000 default leaves ~17%
+	// headroom — thinner than before, and it shrinks as the mapping table grows.
+	//
+	// Re-check with parentASINSourceSQL whenever the catalogue changes materially.
+	// Once the parent set passes the cap, EVERY run truncates and reports failure,
+	// which is exactly the alarm this guard exists to make meaningful.
 	HourlySyncASINLimit = envInt("SYNC_ASIN_LIMIT", 150000)
 
 	// SyncMaxPerRun is a deliberate throttle on how many ASINs one run processes.
@@ -125,14 +129,19 @@ var (
 	// Collapsing the two would train everyone to ignore the truncation alarm, since
 	// it would fire on every deliberately-throttled run.
 	//
-	// Default 0: the throttle is off and a run covers the whole parent set, which
-	// is the production setting for the ten-day cycle. Validation ran with this
-	// hardcoded to 500; left that way the scheduled job would sync 1,500 ASINs a
-	// month against a parent set of ~107,000 and never refresh the catalogue.
+	// Default 0: the throttle is off and a run covers the whole parent set
+	// (124,845 as of 2026-08-19), which is the production setting for the ten-day
+	// cycle. It was hardcoded to 500, then 50, while the cadence and the new
+	// parent-source logic were validated; left throttled the scheduled job would
+	// sync a few hundred ASINs a month and never refresh the catalogue.
 	//
-	// To throttle a run on purpose — ramping up, spreading API spend, working
-	// through a backlog in chunks — set SYNC_MAX_PER_RUN in the environment rather
-	// than changing this default, so the deliberate case stays visible in config.
+	// A throttled run is a NORMAL outcome, not an alarm: it logs "Stopped at
+	// SYNC_MAX_PER_RUN", sets ThrottledPerRun, exits 0, and leaves the rest queued.
+	//
+	// To throttle on purpose — ramping up, spreading API spend, working through a
+	// backlog in chunks — set SYNC_MAX_PER_RUN in the environment rather than
+	// changing this default, so the deliberate case stays visible in config:
+	//   SYNC_MAX_PER_RUN=50 go run ./cmd/job
 	SyncMaxPerRun = envInt("SYNC_MAX_PER_RUN", 0)
 
 	// StaleDataThresholdDays is how old product data may be before it is refetched.
@@ -914,9 +923,9 @@ func (m *MasterSyncManager) resolveFanOutTables() error {
 }
 
 // fetchParentASINsToSync retrieves the PARENT ASINs the sync must fetch from
-// JungleScout: every parent with at least one visible child, plus visible ASINs
-// that have no mapping row (treated as their own parent). Children are never
-// fetched directly — their data is copied from the parent by the fan-out.
+// JungleScout: every distinct parent_asin in the mapping table, regardless of
+// asin_visibility. Children are never fetched directly — their data is copied
+// from the parent by the fan-out.
 // READ operation - uses stagingClient only
 func (m *MasterSyncManager) fetchParentASINsToSync() ([]string, error) {
 	query := fmt.Sprintf(`
@@ -1402,7 +1411,7 @@ func (m *MasterSyncManager) storeProductData(apiResponse *junglescout.ProductAPI
 			}
 		}
 
-		// Step 3: Copy this parent's row onto every visible child.
+		// Step 3: Copy this parent's row onto every child.
 		// A fan-out failure is NOT critical: the parent row is already stored and
 		// the API call is not wasted, so log it and keep going.
 		if childRows, fanErr := fanOutProductRow(m.stagingClient, m.stagingTables, asin, reportDate); fanErr != nil {
@@ -1683,7 +1692,7 @@ func (m *MasterSyncManager) storeSalesEstimateData(apiResponse *junglescout.Sale
 		successCount++
 	}
 
-	// Copy every sales row of this parent onto its visible children.
+	// Copy every sales row of this parent onto its children.
 	// Non-critical: the parent rows are stored and the API call is not wasted.
 	if successCount > 0 {
 		if childRows, fanErr := fanOutSalesRows(m.stagingClient, m.stagingTables, attrs.ASIN, marketplace, ""); fanErr != nil {
@@ -2346,7 +2355,7 @@ func (m *HourlySyncManager) RunHourlySync(marketplace string) {
 
 		// ==================== STEP 2: ADD NEW ASINs ====================
 		m.debugLog("---------- STEP 2: ADD NEW ASINs ----------")
-		m.debugLog("Adding new visible ASINs to sync_status...")
+		m.debugLog("Adding new ASINs to sync_status...")
 		newASINs, err := m.addNewASINsToSyncStatus()
 		if err != nil {
 			m.addHourlyError("db", fmt.Sprintf("Failed to add new ASINs: %v", err))
@@ -2619,7 +2628,9 @@ func (m *HourlySyncManager) manualASINSyncInfo() ([]ASINSyncInfo, error) {
 	return results, nil
 }
 
-// cleanupSyncStatus removes sync_status records for ASINs with asin_visibility=false
+// cleanupSyncStatus removes sync_status records for ASINs that are no longer in
+// the parent set (deleted from the catalogue, or now mapped as someone's child).
+// asin_visibility is not considered — inactive ASINs stay queued.
 // NOTE: sync_status is staging-only, production writes are skipped
 func (m *HourlySyncManager) cleanupSyncStatus() (int, error) {
 	stagingSyncTable := m.stagingClient.TableName("jungle_scout_sync_status")
@@ -3313,7 +3324,7 @@ func (m *HourlySyncManager) storeHourlyProductData(apiResponse *junglescout.Prod
 			}
 		}
 
-		// Copy this parent's row onto every visible child. Non-critical: the
+		// Copy this parent's row onto every child. Non-critical: the
 		// parent row is stored and the API call is not wasted.
 		stagingChildRows, fanErr := fanOutProductRow(m.stagingClient, m.stagingTables, asin, reportDate)
 		if fanErr != nil {
@@ -3499,7 +3510,7 @@ func (m *HourlySyncManager) storeHourlySalesData(apiResponse *junglescout.SalesE
 		m.monitorLog("[Sales] %s: %d rows upserted into production %s", attrs.ASIN, prodInserted, prodSalesTable)
 	}
 
-	// Copy this parent's sales rows onto its visible children. Non-critical.
+	// Copy this parent's sales rows onto its children. Non-critical.
 	if stagingInserted > 0 {
 		stagingChildRows, fanErr := fanOutSalesRows(m.stagingClient, m.stagingTables, attrs.ASIN, marketplace, minDate)
 		if fanErr != nil {
