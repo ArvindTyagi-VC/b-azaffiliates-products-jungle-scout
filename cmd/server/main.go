@@ -6,11 +6,17 @@ import (
 	"os"
 
 	"azaffiliates/internal/api"
+	"azaffiliates/internal/api/handlers"
 	"azaffiliates/internal/database"
 	"azaffiliates/internal/junglescout"
 )
 
 func main() {
+	// Record the resolved sync thresholds up front. The hourly-sync endpoints share
+	// this configuration with the scheduled job, so when a run behaves unexpectedly
+	// the first question is always which values it actually ran with.
+	handlers.LogSyncTuning()
+
 	// Initialize Staging PostgreSQL client
 	log.Println("Initializing Staging PostgreSQL client...")
 	stagingClient, err := database.InitPostgreSQL(

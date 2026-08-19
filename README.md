@@ -153,6 +153,36 @@ DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
 | `JUNGLE_SCOUT_API_KEY` | Yes | - | JungleScout API key |
 | `DISCORD_WEBHOOK_URL` | No | Hardcoded | Discord webhook URL |
 
+### Sync Tuning
+
+These were hardcoded constants; they are now environment variables so a cadence change is a config edit rather than a deploy. Defaults describe the **ten-day cycle** (the sync runs on the 1st, 11th and 21st of each month).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SYNC_ASIN_LIMIT` | `150000` | Max ASINs per run. A **runaway guard**, not a slice size — it sits above the parent set (107,032 measured 2026-08-19) so a healthy run is never truncated. A run that reaches it exits non-zero. **Revisit as the catalogue grows:** once the parent set passes the cap, every run truncates and fails. |
+| `STALE_THRESHOLD_DAYS` | `10` | How old product data may be before it is refetched. **Must match the schedule interval** — see the warning below. |
+| `NOT_FOUND_RETRY_DAYS` | `10` | How long an ASIN JungleScout does not know about is left alone. Keep at or below the cycle length. |
+| `SALES_WORKERS` | `12` | Sales-fetch worker pool size. All workers share one 14 req/s rate limiter, so raising this fills the existing budget rather than exceeding it. |
+| `MAX_FAILURE_RATE` | `0.10` | Share of ASINs that may fail before the job exits non-zero. |
+| `MAX_FULL_BACKFILLS` | `5000` | Max never-synced ASINs per run that pull a full year of sales. Beyond the cap the backfill is **deferred to the next run**, not shortened — no data is lost. |
+| `SALES_RETRY_PASSES` | `1` | Extra passes over ASINs that failed on transient errors (429, network, timeout). `0` disables the retry pass. |
+| `MAX_CONSECUTIVE_DB_FAILURES` | `25` | Database write failures in a row before the run is abandoned. A single failure is retried instead of ending the run. |
+| `DEBUG_MODE` | `false` | Verbose logging. Set to `true` to enable. |
+
+> **Cadence warning:** `STALE_THRESHOLD_DAYS` and the cron schedule are coupled. If the cron runs every 10 days but the threshold is left at 30, the first run of the month works and **the next two select zero ASINs** — nothing is stale yet. The job logs "no ASINs to sync" and exits successfully. `LogSyncTuning()` prints the resolved values at the start of every run for exactly this reason.
+
+### Scheduling
+
+The scheduled sync must be triggered as a **Cloud Run Job** (`cmd/job`), not via `POST /admin/hourly-sync`. A Cloud Run service caps requests at 60 minutes and a full-set run takes 1.5–2 hours, so the request would be cut off mid-sync. The HTTP endpoints remain for manual and CSV-driven runs.
+
+```
+Cloud Scheduler cron (Asia/Kolkata):  0 2 1,11,21 * *
+Cloud Run Job task timeout:           6h
+Cloud Run Job max retries:            0
+```
+
+Runs are serialised by a PostgreSQL advisory lock taken on the staging database, so a hung execution cannot overlap with the next scheduled one. If the lock cannot be acquired the job exits non-zero without syncing.
+
 ---
 
 ## Database Schema

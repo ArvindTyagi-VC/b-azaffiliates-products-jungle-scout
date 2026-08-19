@@ -235,9 +235,66 @@ func fanOutProductRow(pg *database.PostgreSQLClient, t syncTables, parentASIN, r
 	return n, nil
 }
 
+// salesFanOutMode selects which slice of a parent's sales history is copied onto
+// its children.
+//
+// Background: this query originally had no date bound at all, so every run
+// re-copied each parent's entire sales history onto every child — roughly a
+// full-table rewrite (~34M upserts in production) to deliver whatever the API had
+// just returned, which for an incremental fetch is about ten days. The cost also
+// grew with every month of accumulated history.
+//
+// Bounding it by date fixes that, but the unbounded copy had one accidental
+// virtue: it repaired gaps. A child added to the mapping table after its parent
+// was last fetched, or one whose earlier fan-out failed, got its full history
+// filled in on the next run. A date bound alone would silently strand those
+// children with only the newest window, permanently. Hence two modes: the bounded
+// copy for the normal case, and an explicit backfill for children that have no
+// rows yet.
+//
+// Note the asymmetry with productFanOutQuery, which needs no equivalent: product
+// rows are point-in-time snapshots keyed by report_date, so a new child correctly
+// starts from the current run's snapshot and has no history to recover.
+type salesFanOutMode int
+
+const (
+	// salesFanOutIncremental copies rows dated at or after a lower bound onto all
+	// visible children. Params: $1 = parent ASIN, $2 = marketplace, $3 = min date.
+	salesFanOutIncremental salesFanOutMode = iota
+
+	// salesFanOutBackfill copies the parent's full history, but only onto children
+	// that currently have no sales rows at all. Params: $1 = parent, $2 = marketplace.
+	salesFanOutBackfill
+
+	// salesFanOutAll copies the parent's full history onto every visible child —
+	// the original unbounded behaviour. Retained for the master/manual sync paths,
+	// which do a deliberate full resync and do not track a per-ASIN fetch window,
+	// so narrowing them here would change what those endpoints do.
+	// Params: $1 = parent, $2 = marketplace.
+	salesFanOutAll
+)
+
 // salesFanOutQuery builds the parent -> children copy for sales estimate data.
-// Params: $1 = parent ASIN, $2 = marketplace.
-func salesFanOutQuery(t syncTables) string {
+func salesFanOutQuery(t syncTables, mode salesFanOutMode) string {
+	// Extra predicate per mode. Both keep the row set proportional to real work:
+	// the incremental bound to the window just fetched, the backfill to children
+	// that have nothing.
+	var scope string
+	switch mode {
+	case salesFanOutBackfill:
+		scope = fmt.Sprintf(`
+		  AND NOT EXISTS (
+			  SELECT 1 FROM %[1]s existing
+			  WHERE existing.asin = m.child_asin
+				AND existing.marketplace = s.marketplace
+		  )`, t.sales)
+	case salesFanOutAll:
+		scope = "" // no extra bound: the parent's whole history, every child
+	default:
+		scope = `
+		  AND s.date >= $3`
+	}
+
 	return fmt.Sprintf(`
 		INSERT INTO %[1]s (
 			asin, marketplace, date, parent_asin, is_parent, is_variant, created_at, %[2]s
@@ -249,7 +306,7 @@ func salesFanOutQuery(t syncTables) string {
 		WHERE s.asin = $1
 		  AND s.marketplace = $2
 		  AND m.child_asin <> s.asin
-		  AND %[7]s
+		  AND %[7]s%[8]s
 		ON CONFLICT (asin, marketplace, date) DO UPDATE SET
 			parent_asin = EXCLUDED.parent_asin,
 			is_parent = EXCLUDED.is_parent,
@@ -264,16 +321,72 @@ func salesFanOutQuery(t syncTables) string {
 		t.asin,
 		excluded(salesCopyColumns),
 		notItselfAParent(t, "m.child_asin"),
+		scope,
 	)
 }
 
-// fanOutSalesRows copies every sales-estimate row of a parent onto each of its
-// visible children, for the given marketplace. Returns rows written.
-func fanOutSalesRows(pg *database.PostgreSQLClient, t syncTables, parentASIN, marketplace string) (int64, error) {
-	res, err := pg.DB.Exec(salesFanOutQuery(t), parentASIN, marketplace)
+// childrenMissingSalesQuery counts visible children of a parent that have no sales
+// rows at all, i.e. those a date-bounded fan-out would leave stranded.
+func childrenMissingSalesQuery(t syncTables) string {
+	return fmt.Sprintf(`
+		SELECT COUNT(*)
+		FROM %[1]s m
+		JOIN %[2]s a ON a.asin = m.child_asin AND a.asin_visibility = true
+		WHERE m.parent_asin = $1
+		  AND m.child_asin <> m.parent_asin
+		  AND %[4]s
+		  AND NOT EXISTS (
+			  SELECT 1 FROM %[3]s s
+			  WHERE s.asin = m.child_asin AND s.marketplace = $2
+		  )
+	`, t.mapping, t.asin, t.sales, notItselfAParent(t, "m.child_asin"))
+}
+
+// fanOutSalesRows copies a parent's sales rows onto its visible children.
+//
+// minDate bounds the copy to the window just fetched. Pass an empty string for the
+// original unbounded copy onto every child — what the master and manual sync paths
+// do, since they are deliberate full resyncs and do not track a per-ASIN window.
+//
+// Children that have no sales rows yet are handled separately: they get the
+// parent's full history regardless of minDate, because for them there is no
+// earlier run to have filled it in. That second statement only runs when such a
+// child actually exists, so the common case stays a single bounded insert.
+func fanOutSalesRows(pg *database.PostgreSQLClient, t syncTables, parentASIN, marketplace, minDate string) (int64, error) {
+	var total int64
+
+	if minDate == "" {
+		res, err := pg.DB.Exec(salesFanOutQuery(t, salesFanOutAll), parentASIN, marketplace)
+		if err != nil {
+			return 0, fmt.Errorf("sales fan-out (full history) for parent %s failed: %w", parentASIN, err)
+		}
+		n, _ := res.RowsAffected()
+		return n, nil
+	}
+
+	res, err := pg.DB.Exec(salesFanOutQuery(t, salesFanOutIncremental), parentASIN, marketplace, minDate)
 	if err != nil {
 		return 0, fmt.Errorf("sales fan-out for parent %s failed: %w", parentASIN, err)
 	}
 	n, _ := res.RowsAffected()
-	return n, nil
+	total += n
+
+	// Only pay for the backfill statement when a child genuinely has nothing.
+	var missing int
+	if err := pg.DB.QueryRow(childrenMissingSalesQuery(t), parentASIN, marketplace).Scan(&missing); err != nil {
+		// Not fatal: the bounded copy above already succeeded. Report it so a
+		// persistent failure here is visible rather than quietly skipping backfills.
+		return total, fmt.Errorf("could not check for children missing sales history under parent %s: %w", parentASIN, err)
+	}
+	if missing == 0 {
+		return total, nil
+	}
+
+	backfillRes, err := pg.DB.Exec(salesFanOutQuery(t, salesFanOutBackfill), parentASIN, marketplace)
+	if err != nil {
+		return total, fmt.Errorf("sales backfill fan-out for parent %s (%d children with no history) failed: %w",
+			parentASIN, missing, err)
+	}
+	bn, _ := backfillRes.RowsAffected()
+	return total + bn, nil
 }
