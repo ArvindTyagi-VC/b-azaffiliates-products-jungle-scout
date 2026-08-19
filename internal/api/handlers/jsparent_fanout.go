@@ -14,7 +14,7 @@ import (
 //
 // The JungleScout sync fetches data for PARENT ASINs only. Every parent row that
 // lands in jungle_scout_product_data / jungle_scout_sales_estimate_data is then
-// copied verbatim onto each of that parent's visible children, as listed in the
+// copied verbatim onto each of that parent's children, as listed in the
 // {prefix}parent_asin mapping table.
 //
 // Mapping table shape ({prefix}parent_asin):
@@ -118,34 +118,34 @@ func excluded(cols []string) string {
 }
 
 // parentASINSourceSQL returns a SELECT yielding the distinct set of ASINs the
-// sync must fetch from JungleScout, as a single "asin" column:
+// sync must fetch from JungleScout, as a single "asin" column: every DISTINCT
+// parent_asin in the {prefix}parent_asin mapping table.
 //
-//  1. every parent that has at least one visible child, plus
-//  2. every visible ASIN absent from the mapping table, treated as its own
-//     parent so that coverage is not lost.
+// That is the whole rule — no join, no filter beyond NULL/blank. Measured on
+// vx-3-staging 2026-08-19 it yields 124,845 parents from 347,573 mapping rows.
 //
-// Branch 2 matters: ~2k visible ASINs have no mapping row, and without it they
-// would never be fetched. Note that branch 1 deliberately includes parents whose
-// own asin_visibility is false — a hidden parent still has to be fetched to feed
-// its visible children.
+// Two earlier restrictions were removed deliberately, do not reinstate them
+// without saying so:
+//
+//  1. asin_visibility is NOT consulted. The sync covers the whole catalogue,
+//     active and inactive alike, because visibility is a frontend display flag
+//     that flips back and forth, and an ASIN that becomes visible again would
+//     otherwise have no data until the next full cycle.
+//  2. The join to the active ASIN table is gone. It previously restricted the
+//     set to parents whose children still exist there, which cut 124,845 down
+//     to ~107,032. Parents are now taken from the mapping table alone.
+//
+// NOTE: the old "ASINs absent from the mapping table, treated as their own
+// parent" branch is also gone. It covered ~2k ASINs that have no mapping row;
+// those are no longer fetched, and the cleanup step will drop them from
+// sync_status on the next run. Add the branch back if that coverage is wanted.
 func parentASINSourceSQL(t syncTables) string {
 	return fmt.Sprintf(`
 		SELECT DISTINCT m.parent_asin AS asin
 		FROM %[1]s m
-		JOIN %[2]s a ON a.asin = m.child_asin
-		WHERE a.asin_visibility = true
-		  AND m.parent_asin IS NOT NULL
+		WHERE m.parent_asin IS NOT NULL
 		  AND m.parent_asin != ''
-		UNION
-		SELECT a.asin
-		FROM %[2]s a
-		WHERE a.asin_visibility = true
-		  AND a.asin IS NOT NULL
-		  AND a.asin != ''
-		  AND NOT EXISTS (
-			  SELECT 1 FROM %[1]s m2 WHERE m2.child_asin = a.asin
-		  )
-	`, t.mapping, t.asin)
+	`, t.mapping)
 }
 
 // productFanOutQuery builds the parent -> children copy for product data.
@@ -158,7 +158,7 @@ func productFanOutQuery(t syncTables) string {
 		SELECT m.child_asin, p.report_date, p.asin, true, false, CURRENT_TIMESTAMP, %[3]s
 		FROM %[1]s p
 		JOIN %[4]s m ON m.parent_asin = p.asin
-		JOIN %[5]s a ON a.asin = m.child_asin AND a.asin_visibility = true
+		JOIN %[5]s a ON a.asin = m.child_asin
 		WHERE p.asin = $1
 		  AND p.report_date = $2
 		  AND m.child_asin <> p.asin
@@ -180,9 +180,8 @@ func productFanOutQuery(t syncTables) string {
 }
 
 // syncStatusCleanupQuery removes sync_status rows that are no longer in the parent
-// set. It must be the parent set and NOT "visible ASINs": a parent may itself be
-// asin_visibility=false while still needing to be fetched to feed its visible
-// children, and child ASINs must never be queued for their own API call.
+// set. It must be the parent set and NOT "every ASIN": child ASINs must never be
+// queued for their own API call, since their data is copied from the parent.
 func syncStatusCleanupQuery(syncTable string, t syncTables) string {
 	return fmt.Sprintf(`
 		DELETE FROM %s
@@ -202,10 +201,10 @@ func syncStatusAddNewQuery(syncTable string, t syncTables) string {
 }
 
 // notItselfAParent returns a SQL predicate that excludes a candidate child ASIN
-// which is ITSELF a parent of at least one visible child.
+// which is ITSELF a parent of at least one child.
 //
 // The mapping is not a clean two-level tree: ~484 ASINs appear both as a parent
-// (of visible children) and as a child of some other parent. Such an ASIN is
+// (of children) and as a child of some other parent. Such an ASIN is
 // fetched from JungleScout directly, because its own children depend on it. If
 // the fan-out were also allowed to target it, the other parent's copied data
 // would overwrite its real fetched data, and which value won would depend on
@@ -217,14 +216,14 @@ func notItselfAParent(t syncTables, childCol string) string {
 		NOT EXISTS (
 			SELECT 1
 			FROM %[1]s m2
-			JOIN %[2]s a2 ON a2.asin = m2.child_asin AND a2.asin_visibility = true
+			JOIN %[2]s a2 ON a2.asin = m2.child_asin
 			WHERE m2.parent_asin = %[3]s
 			  AND m2.child_asin <> m2.parent_asin
 		)`, t.mapping, t.asin, childCol)
 }
 
 // fanOutProductRow copies a freshly written parent row in jungle_scout_product_data
-// onto every visible child of that parent, for the given report_date.
+// onto every child of that parent, for the given report_date.
 // Returns the number of child rows written.
 func fanOutProductRow(pg *database.PostgreSQLClient, t syncTables, parentASIN, reportDate string) (int64, error) {
 	res, err := pg.DB.Exec(productFanOutQuery(t), parentASIN, reportDate)
@@ -259,14 +258,14 @@ type salesFanOutMode int
 
 const (
 	// salesFanOutIncremental copies rows dated at or after a lower bound onto all
-	// visible children. Params: $1 = parent ASIN, $2 = marketplace, $3 = min date.
+	// children. Params: $1 = parent ASIN, $2 = marketplace, $3 = min date.
 	salesFanOutIncremental salesFanOutMode = iota
 
 	// salesFanOutBackfill copies the parent's full history, but only onto children
 	// that currently have no sales rows at all. Params: $1 = parent, $2 = marketplace.
 	salesFanOutBackfill
 
-	// salesFanOutAll copies the parent's full history onto every visible child —
+	// salesFanOutAll copies the parent's full history onto every child —
 	// the original unbounded behaviour. Retained for the master/manual sync paths,
 	// which do a deliberate full resync and do not track a per-ASIN fetch window,
 	// so narrowing them here would change what those endpoints do.
@@ -302,7 +301,7 @@ func salesFanOutQuery(t syncTables, mode salesFanOutMode) string {
 		SELECT m.child_asin, s.marketplace, s.date, s.asin, false, true, CURRENT_TIMESTAMP, %[3]s
 		FROM %[1]s s
 		JOIN %[4]s m ON m.parent_asin = s.asin
-		JOIN %[5]s a ON a.asin = m.child_asin AND a.asin_visibility = true
+		JOIN %[5]s a ON a.asin = m.child_asin
 		WHERE s.asin = $1
 		  AND s.marketplace = $2
 		  AND m.child_asin <> s.asin
@@ -325,13 +324,13 @@ func salesFanOutQuery(t syncTables, mode salesFanOutMode) string {
 	)
 }
 
-// childrenMissingSalesQuery counts visible children of a parent that have no sales
+// childrenMissingSalesQuery counts children of a parent that have no sales
 // rows at all, i.e. those a date-bounded fan-out would leave stranded.
 func childrenMissingSalesQuery(t syncTables) string {
 	return fmt.Sprintf(`
 		SELECT COUNT(*)
 		FROM %[1]s m
-		JOIN %[2]s a ON a.asin = m.child_asin AND a.asin_visibility = true
+		JOIN %[2]s a ON a.asin = m.child_asin
 		WHERE m.parent_asin = $1
 		  AND m.child_asin <> m.parent_asin
 		  AND %[4]s
@@ -342,7 +341,7 @@ func childrenMissingSalesQuery(t syncTables) string {
 	`, t.mapping, t.asin, t.sales, notItselfAParent(t, "m.child_asin"))
 }
 
-// fanOutSalesRows copies a parent's sales rows onto its visible children.
+// fanOutSalesRows copies a parent's sales rows onto its children.
 //
 // minDate bounds the copy to the window just fetched. Pass an empty string for the
 // original unbounded copy onto every child — what the master and manual sync paths
