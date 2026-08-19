@@ -111,6 +111,30 @@ var (
 	// parentASINSourceSQL whenever the catalogue changes materially.
 	HourlySyncASINLimit = envInt("SYNC_ASIN_LIMIT", 150000)
 
+	// SyncMaxPerRun is a deliberate throttle on how many ASINs one run processes.
+	// It is a different thing from HourlySyncASINLimit, and the difference is what
+	// happens when a run reaches it:
+	//
+	//   HourlySyncASINLimit — a runaway guard sized above the parent set. Reaching
+	//     it means the workload was not what it should have been, so the run is
+	//     flagged as truncated and the job exits non-zero.
+	//   SyncMaxPerRun       — an operator asking for a smaller run on purpose
+	//     (ramping up, spreading API spend, working through a backlog in chunks).
+	//     Reaching it is the expected outcome: no alarm, no non-zero exit.
+	//
+	// Collapsing the two would train everyone to ignore the truncation alarm, since
+	// it would fire on every deliberately-throttled run.
+	//
+	// Default 0: the throttle is off and a run covers the whole parent set, which
+	// is the production setting for the ten-day cycle. Validation ran with this
+	// hardcoded to 500; left that way the scheduled job would sync 1,500 ASINs a
+	// month against a parent set of ~107,000 and never refresh the catalogue.
+	//
+	// To throttle a run on purpose — ramping up, spreading API spend, working
+	// through a backlog in chunks — set SYNC_MAX_PER_RUN in the environment rather
+	// than changing this default, so the deliberate case stays visible in config.
+	SyncMaxPerRun = envInt("SYNC_MAX_PER_RUN", 0)
+
 	// StaleDataThresholdDays is how old product data may be before it is refetched.
 	// Must match the schedule interval.
 	StaleDataThresholdDays = envInt("STALE_THRESHOLD_DAYS", 10)
@@ -186,8 +210,8 @@ func envFloat(key string, def float64) float64 {
 // in the logs of every run: when a cycle behaves unexpectedly, the first question
 // is always which thresholds it actually ran with.
 func LogSyncTuning() {
-	log.Printf("[CONFIG] SYNC_ASIN_LIMIT=%d STALE_THRESHOLD_DAYS=%d NOT_FOUND_RETRY_DAYS=%d SALES_WORKERS=%d MAX_FAILURE_RATE=%.2f MAX_FULL_BACKFILLS=%d SALES_RETRY_PASSES=%d",
-		HourlySyncASINLimit, StaleDataThresholdDays, ProductNotFoundRetryDays,
+	log.Printf("[CONFIG] SYNC_ASIN_LIMIT=%d SYNC_MAX_PER_RUN=%d STALE_THRESHOLD_DAYS=%d NOT_FOUND_RETRY_DAYS=%d SALES_WORKERS=%d MAX_FAILURE_RATE=%.2f MAX_FULL_BACKFILLS=%d SALES_RETRY_PASSES=%d",
+		HourlySyncASINLimit, SyncMaxPerRun, StaleDataThresholdDays, ProductNotFoundRetryDays,
 		SalesWorkerCount, MaxFailureRate, MaxFullBackfills, SalesRetryPasses)
 
 	if StaleDataThresholdDays < ProductNotFoundRetryDays {
@@ -233,6 +257,11 @@ type HourlySyncStatus struct {
 	// therefore truncated. The cap sits far above the parent set, so this means
 	// something upstream is wrong — it is an incident, not a successful full sync.
 	LimitReached bool `json:"limit_reached"`
+
+	// ThrottledPerRun is true when the run stopped at SYNC_MAX_PER_RUN. Unlike
+	// LimitReached this is a normal outcome: an operator asked for a smaller run,
+	// the remaining ASINs stay queued, and the job still exits 0.
+	ThrottledPerRun bool `json:"throttled_per_run"`
 
 	// DeferredBackfills counts never-synced ASINs whose full-year sales fetch was
 	// postponed to a later run by MAX_FULL_BACKFILLS. Their product data was still
@@ -2706,6 +2735,18 @@ func (m *HourlySyncManager) selectASINsToSync() ([]ASINSyncInfo, error) {
 		return added
 	}
 
+	// The effective ceiling is the tighter of the runaway guard and the deliberate
+	// throttle. Which one bit matters for how the result is reported: hitting the
+	// throttle is expected, hitting the guard is an incident.
+	limit := HourlySyncASINLimit
+	throttled := false
+	if SyncMaxPerRun > 0 && SyncMaxPerRun < limit {
+		limit = SyncMaxPerRun
+		throttled = true
+		m.monitorLog("[Select] SYNC_MAX_PER_RUN=%d is throttling this run (guard is %d) — a partial run is expected, not an error",
+			SyncMaxPerRun, HourlySyncASINLimit)
+	}
+
 	// ---- Tier 1: never fetched (or past the not-found retry window) ----
 	m.debugLog("[Select] Querying NEW ASINs (has_product_data=false, retry window passed)...")
 	newRows, err := m.stagingClient.DB.Query(fmt.Sprintf(`
@@ -2715,7 +2756,7 @@ func (m *HourlySyncManager) selectASINsToSync() ([]ASINSyncInfo, error) {
 		AND (product_fetch_attempted_at IS NULL OR product_fetch_attempted_at < $1)
 		ORDER BY created_at ASC, asin ASC
 		LIMIT %d
-	`, syncTable, HourlySyncASINLimit), retryThreshold)
+	`, syncTable, limit), retryThreshold)
 	if err != nil {
 		m.debugLog("[Select] ERROR: Failed to query new ASINs: %v", err)
 		return nil, fmt.Errorf("failed to query new ASINs: %w", err)
@@ -2729,7 +2770,7 @@ func (m *HourlySyncManager) selectASINsToSync() ([]ASINSyncInfo, error) {
 	m.debugLog("[Select] Found %d NEW ASINs", newCount)
 
 	// ---- Tier 2: product data older than the staleness threshold ----
-	if remaining := HourlySyncASINLimit - len(results); remaining > 0 {
+	if remaining := limit - len(results); remaining > 0 {
 		m.debugLog("[Select] Querying STALE ASINs (%d slots remaining)...", remaining)
 		staleRows, err := m.stagingClient.DB.Query(fmt.Sprintf(`
 			SELECT asin, sales_estimate_data_synced_at
@@ -2753,7 +2794,7 @@ func (m *HourlySyncManager) selectASINsToSync() ([]ASINSyncInfo, error) {
 	}
 
 	// ---- Tier 3: product fresh, sales missing ----
-	if remaining := HourlySyncASINLimit - len(results); remaining > 0 {
+	if remaining := limit - len(results); remaining > 0 {
 		m.debugLog("[Select] Querying SALES GAP ASINs (%d slots remaining)...", remaining)
 		gapRows, err := m.stagingClient.DB.Query(fmt.Sprintf(`
 			SELECT asin, sales_estimate_data_synced_at
@@ -2785,13 +2826,23 @@ func (m *HourlySyncManager) selectASINsToSync() ([]ASINSyncInfo, error) {
 	// unfiltered mapping table, a visibility flag applied to the wrong scope —
 	// not a normal full sync. Say so loudly: a truncated run otherwise looks
 	// exactly like a clean one in the logs and in the Discord summary.
-	if len(results) >= HourlySyncASINLimit {
-		msg := fmt.Sprintf("selection reached SYNC_ASIN_LIMIT (%d) — the run is TRUNCATED and some ASINs were not queued; treat this as an incident, not a full sync", HourlySyncASINLimit)
-		log.Printf("%s CRITICAL: %s", m.logPrefix(), msg)
-		m.addHourlyError("other", msg)
-		m.statusMutex.Lock()
-		m.status.LimitReached = true
-		m.statusMutex.Unlock()
+	// Only the runaway guard raises the alarm. A throttled run is also partial, but
+	// deliberately so — flagging it would make the alarm meaningless.
+	if len(results) >= limit {
+		if throttled {
+			m.monitorLog("[Select] Stopped at SYNC_MAX_PER_RUN=%d as configured — remaining ASINs stay queued for the next run",
+				SyncMaxPerRun)
+			m.statusMutex.Lock()
+			m.status.ThrottledPerRun = true
+			m.statusMutex.Unlock()
+		} else {
+			msg := fmt.Sprintf("selection reached SYNC_ASIN_LIMIT (%d) — the run is TRUNCATED and some ASINs were not queued; treat this as an incident, not a full sync", HourlySyncASINLimit)
+			log.Printf("%s CRITICAL: %s", m.logPrefix(), msg)
+			m.addHourlyError("other", msg)
+			m.statusMutex.Lock()
+			m.status.LimitReached = true
+			m.statusMutex.Unlock()
+		}
 	}
 
 	// Cap the number of never-synced ASINs that will pull a full year of sales in

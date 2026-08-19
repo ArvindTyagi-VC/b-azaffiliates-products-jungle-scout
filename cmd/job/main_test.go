@@ -63,6 +63,40 @@ func TestExitCodeForTruncatedRun(t *testing.T) {
 	}
 }
 
+// A run throttled by SYNC_MAX_PER_RUN is partial on purpose: the operator asked
+// for a smaller run and the rest stays queued. It must NOT be reported as a
+// failure, otherwise every deliberately-throttled run cries wolf and the real
+// truncation alarm stops meaning anything.
+func TestExitCodeForThrottledRunIsHealthy(t *testing.T) {
+	status := handlers.HourlySyncStatus{
+		TotalASINsProcessed:   500,
+		SuccessfulProductSync: 500,
+		SuccessfulSalesSync:   500,
+		FailedASINs:           0,
+		ThrottledPerRun:       true,
+		LimitReached:          false,
+	}
+
+	if got := exitCodeFor(status); got != 0 {
+		t.Errorf("exitCodeFor(throttled) = %d, want 0 — a deliberate partial run is not a failure", got)
+	}
+}
+
+// The guard is still an incident even when a throttle is also configured.
+func TestExitCodeForGuardBreachStillFails(t *testing.T) {
+	status := handlers.HourlySyncStatus{
+		TotalASINsProcessed:   150000,
+		SuccessfulProductSync: 150000,
+		FailedASINs:           0,
+		ThrottledPerRun:       false,
+		LimitReached:          true,
+	}
+
+	if got := exitCodeFor(status); got != 1 {
+		t.Errorf("exitCodeFor(guard breach) = %d, want 1", got)
+	}
+}
+
 func TestExitCodeForStoppedEarly(t *testing.T) {
 	status := handlers.HourlySyncStatus{
 		TotalASINsProcessed:   40000,
