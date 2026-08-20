@@ -1,2 +1,9 @@
 .env
 .claude
+test-job-local.sh
+*.exe
+verify-100.sql
+test-100.ps1
+test-100-dev.ps1
+test-100-staging.ps1
+test-full-staging.ps1

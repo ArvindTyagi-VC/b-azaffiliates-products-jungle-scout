@@ -5,11 +5,85 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
+
+// maxRateLimitWait caps how long a single 429 may hold a request. A run that is
+// rate limited for minutes at a time is better served by failing the ASIN and
+// letting the end-of-run retry pass revisit it than by blocking a worker.
+const maxRateLimitWait = 90 * time.Second
+
+// parseRetryAfter reads an HTTP Retry-After header, which may be either a count of
+// seconds or an HTTP date. Returns 0 when absent or unparseable.
+func parseRetryAfter(header string) time.Duration {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return 0
+	}
+
+	if secs, err := strconv.Atoi(header); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+
+	// http.ParseTime covers the three formats the HTTP spec allows, all of which
+	// spell the zone "GMT". Also try RFC1123 and RFC3339 so a server that sends
+	// "UTC" or an ISO timestamp still gets its wait honoured rather than silently
+	// falling through to generic backoff.
+	for _, parse := range []func(string) (time.Time, error){
+		http.ParseTime,
+		func(s string) (time.Time, error) { return time.Parse(time.RFC1123, s) },
+		func(s string) (time.Time, error) { return time.Parse(time.RFC3339, s) },
+	} {
+		when, err := parse(header)
+		if err != nil {
+			continue
+		}
+		if d := time.Until(when); d > 0 {
+			return d
+		}
+		return 0
+	}
+	return 0
+}
+
+// parseRetryAgainAt extracts the wait implied by JungleScout's error detail, which
+// reads like "retry again at 2021-03-19T00:55:19-06:00". Returns 0 when the phrase
+// is missing, the timestamp will not parse, or the moment has already passed.
+func parseRetryAgainAt(detail string) time.Duration {
+	const marker = "retry again at"
+
+	idx := strings.Index(strings.ToLower(detail), marker)
+	if idx < 0 {
+		return 0
+	}
+
+	stamp := strings.TrimSpace(detail[idx+len(marker):])
+	// Trim anything trailing the timestamp (a full stop, further prose).
+	if cut := strings.IndexAny(stamp, " ,;"); cut > 0 {
+		stamp = stamp[:cut]
+	}
+	stamp = strings.Trim(stamp, ".")
+
+	for _, layout := range []string{time.RFC3339, "2006-01-02T15:04:05Z0700", "2006-01-02 15:04:05"} {
+		when, err := time.Parse(layout, stamp)
+		if err != nil {
+			continue
+		}
+		if d := time.Until(when); d > 0 {
+			return d
+		}
+		return 0
+	}
+	return 0
+}
 
 // Client represents a JungleScout API client with rate limiting
 type Client struct {
@@ -96,29 +170,52 @@ func (c *Client) doRequest(method, endpoint string, body interface{}) (*http.Res
 			continue
 		}
 
-		// Handle rate limiting (429)
+		// Handle rate limiting (429).
+		//
+		// JungleScout says when to come back, in two places: the standard
+		// Retry-After header and a "retry again at <RFC3339>" phrase in the error
+		// detail. This used to detect the phrase and then sleep a flat 5 seconds
+		// regardless of what it said, so a 60-second penalty burned all three
+		// attempts in 15 seconds and the ASIN failed for no reason. Honour the
+		// longer of whatever the server actually told us.
 		if resp.StatusCode == http.StatusTooManyRequests {
 			body, _ := io.ReadAll(resp.Body)
+			retryAfterHeader := resp.Header.Get("Retry-After")
 			resp.Body.Close()
 
-			// Parse retry time from response if available
+			wait := parseRetryAfter(retryAfterHeader)
+
 			var errorResp struct {
 				Errors []struct {
 					Detail string `json:"detail"`
 				} `json:"errors"`
 			}
-
-			if err := json.Unmarshal(body, &errorResp); err == nil && len(errorResp.Errors) > 0 {
-				// Extract retry time from "retry again at 2021-03-19T00:55:19-06:00"
-				detail := errorResp.Errors[0].Detail
-				if strings.Contains(detail, "retry again at") {
-					// Wait for 5 seconds by default or parse the time
-					time.Sleep(5 * time.Second)
+			if err := json.Unmarshal(body, &errorResp); err == nil {
+				for _, e := range errorResp.Errors {
+					if d := parseRetryAgainAt(e.Detail); d > wait {
+						wait = d
+					}
 				}
-			} else {
-				// Default wait time for rate limiting
-				time.Sleep(time.Duration(5*(attempt+1)) * time.Second)
 			}
+
+			// Nothing usable from the server: exponential backoff as before.
+			if wait <= 0 {
+				wait = time.Duration(5*(attempt+1)) * time.Second
+			}
+
+			// Cap the wait so one hostile penalty cannot hold the whole run. The
+			// end-of-run retry pass picks up whatever is still failing, by which
+			// point the rate window has usually moved on.
+			if wait > maxRateLimitWait {
+				log.Printf("[JS] 429: server asked for %s, capping at %s (attempt %d/%d)",
+					wait.Round(time.Second), maxRateLimitWait, attempt+1, maxRetries)
+				wait = maxRateLimitWait
+			}
+
+			lastError = fmt.Errorf("rate limited (429) after %d attempt(s)", attempt+1)
+			log.Printf("[JS] 429 on %s — waiting %s before attempt %d/%d",
+				endpoint, wait.Round(time.Second), attempt+2, maxRetries)
+			time.Sleep(wait)
 			continue
 		}
 

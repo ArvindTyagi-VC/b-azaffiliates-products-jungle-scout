@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,9 +16,9 @@ import (
 
 	"azaffiliates/internal/database"
 	"azaffiliates/internal/junglescout"
-	"azaffiliates/internal/utils"
 
 	"github.com/gin-gonic/gin"
+	"github.com/lib/pq"
 )
 
 // SyncStatus represents the overall status of the sync operation
@@ -36,6 +37,8 @@ type SyncStatus struct {
 	StoppedEarly          bool       `json:"stopped_early"`
 	StopReason            string     `json:"stop_reason,omitempty"`
 	TotalAPICalls         int        `json:"total_api_calls"`
+	IsManual              bool       `json:"is_manual"`
+	ManualSource          string     `json:"manual_source,omitempty"` // uploaded CSV filename
 	Errors                []string   `json:"errors,omitempty"`
 }
 
@@ -51,6 +54,20 @@ type MasterSyncManager struct {
 	stopRequested    bool   // Flag to stop the sync process
 	criticalErrors   int    // Count of critical errors
 	apiCallCount     int    // Simple counter for API calls
+
+	// Table names used by the parent -> child fan-out, resolved once per run so
+	// the frontend_asin lookup is not repeated per ASIN. prodTables stays zero
+	// when running staging-only.
+	stagingTables syncTables
+	prodTables    syncTables
+
+	// Manual mode (is_manual=true): the parent ASINs come from an uploaded CSV
+	// instead of the database selection. manualASINs is the de-duplicated list;
+	// it also scopes every sync_status query for the run, so a manual sync never
+	// picks up ASINs that were left pending by an earlier automatic sync.
+	isManual     bool
+	manualASINs  []string
+	manualSource string // uploaded CSV filename, for logs and status
 }
 
 var (
@@ -63,12 +80,154 @@ var (
 // HOURLY SYNC MANAGER - For Cloud Job Execution
 // ============================================================================
 
-const (
-	HourlySyncASINLimit       = 100
-	StaleDataThresholdDays    = 30
-	ProductNotFoundRetryDays  = 15
-	ProductBatchSize          = 100
+// ProductBatchSize is the number of ASINs sent per JungleScout product call. It
+// is NOT configurable: the API rejects more than 100 per request and the client
+// enforces the same limit, so this must stay at 100.
+const ProductBatchSize = 100
+
+// Sync tuning, read from the environment at process start so a cadence change is
+// a config edit rather than a deploy. Defaults below describe the ten-day cycle
+// (sync on the 1st, 11th and 21st) that replaced the original hourly schedule.
+//
+// The old hourly values were HourlySyncASINLimit=100, StaleDataThresholdDays=30
+// and ProductNotFoundRetryDays=15. Those three are tuned to each other and to the
+// schedule: at 100 ASINs an hour the parent set came round about once a month,
+// which is why staleness was 30 days. On a ten-day cycle one run must cover the
+// whole parent set, so the limit becomes a runaway guard rather than a slice size
+// and the two day-thresholds have to drop to the cycle length. Changing the cron
+// without changing StaleDataThresholdDays makes the 2nd and 3rd run of each month
+// select nothing at all.
+var (
+	// HourlySyncASINLimit caps one run. It is a guard, not a target: it sits above
+	// the parent set so a healthy run is never truncated, and exists so a corrupted
+	// mapping table or a mis-scoped visibility flag cannot turn one run into a
+	// million-ASIN job. A run that reaches it is an incident, not a full sync —
+	// selectASINsToSync logs loudly and the job exits non-zero.
+	//
+	// Sizing: RE-MEASURED on vx-3-staging 2026-08-19 after the parent source became
+	// "every distinct parent_asin in the mapping table" (no asin_visibility filter,
+	// no join to the active ASIN table): the parent set is 124,845, up from the
+	// 107,032 the earlier filtered query returned. The 150,000 default leaves ~17%
+	// headroom — thinner than before, and it shrinks as the mapping table grows.
+	//
+	// Re-check with parentASINSourceSQL whenever the catalogue changes materially.
+	// Once the parent set passes the cap, EVERY run truncates and reports failure,
+	// which is exactly the alarm this guard exists to make meaningful.
+	HourlySyncASINLimit = envInt("SYNC_ASIN_LIMIT", 150000)
+
+	// SyncMaxPerRun is a deliberate throttle on how many ASINs one run processes.
+	// It is a different thing from HourlySyncASINLimit, and the difference is what
+	// happens when a run reaches it:
+	//
+	//   HourlySyncASINLimit — a runaway guard sized above the parent set. Reaching
+	//     it means the workload was not what it should have been, so the run is
+	//     flagged as truncated and the job exits non-zero.
+	//   SyncMaxPerRun       — an operator asking for a smaller run on purpose
+	//     (ramping up, spreading API spend, working through a backlog in chunks).
+	//     Reaching it is the expected outcome: no alarm, no non-zero exit.
+	//
+	// Collapsing the two would train everyone to ignore the truncation alarm, since
+	// it would fire on every deliberately-throttled run.
+	//
+	// Default 0: the throttle is off and a run covers the whole parent set
+	// (124,845 as of 2026-08-19), which is the production setting for the ten-day
+	// cycle. It was hardcoded to 500, then 50, while the cadence and the new
+	// parent-source logic were validated; left throttled the scheduled job would
+	// sync a few hundred ASINs a month and never refresh the catalogue.
+	//
+	// A throttled run is a NORMAL outcome, not an alarm: it logs "Stopped at
+	// SYNC_MAX_PER_RUN", sets ThrottledPerRun, exits 0, and leaves the rest queued.
+	//
+	// To throttle on purpose — ramping up, spreading API spend, working through a
+	// backlog in chunks — set SYNC_MAX_PER_RUN in the environment rather than
+	// changing this default, so the deliberate case stays visible in config:
+	//   SYNC_MAX_PER_RUN=50 go run ./cmd/job
+	SyncMaxPerRun = envInt("SYNC_MAX_PER_RUN", 0)
+
+	// StaleDataThresholdDays is how old product data may be before it is refetched.
+	// Must match the schedule interval.
+	StaleDataThresholdDays = envInt("STALE_THRESHOLD_DAYS", 10)
+
+	// ProductNotFoundRetryDays is how long an ASIN that JungleScout does not know
+	// about is left alone. Keep it at or below the cycle length: a value above it
+	// quantises the retry to the next-but-one run (15 on a 10-day cycle means an
+	// effective 20-day retry).
+	ProductNotFoundRetryDays = envInt("NOT_FOUND_RETRY_DAYS", 10)
+
+	// SalesWorkerCount is the size of the sales-fetch worker pool. All workers
+	// share one rate limiter (14 req/s), so raising this fills the existing budget
+	// instead of exceeding it — it cannot cause 429s on its own.
+	SalesWorkerCount = envInt("SALES_WORKERS", 12)
+
+	// MaxFailureRate is the share of processed ASINs that may fail before the run
+	// is reported as failed. Consumed by cmd/job to pick its exit code.
+	MaxFailureRate = envFloat("MAX_FAILURE_RATE", 0.10)
+
+	// MaxFullBackfills caps how many never-synced ASINs one run will pull a full
+	// year of sales data for. Beyond the cap an ASIN still gets its product data
+	// and its incremental sales window; the year-long backfill waits for the next
+	// run. Without this, a large batch of new ASINs writes tens of millions of
+	// sales rows in a single execution.
+	MaxFullBackfills = envInt("MAX_FULL_BACKFILLS", 5000)
+
+	// SalesRetryPasses is how many extra passes the run makes over ASINs that
+	// failed on transient errors (429, network, timeout) before they are recorded
+	// as failed. 0 disables the retry pass.
+	SalesRetryPasses = envInt("SALES_RETRY_PASSES", 1)
+
+	// MaxConsecutiveDBFailures is how many database write failures in a row are
+	// tolerated before the run is abandoned. A single failure used to stop the
+	// whole run: cheap when a run was 100 ASINs, but on a full-set run it throws
+	// away the tens of thousands of ASINs that had not been reached yet, and the
+	// next attempt is a whole cycle away. One failure is now retried; only a
+	// sustained run of them means the database is genuinely gone.
+	MaxConsecutiveDBFailures = envInt("MAX_CONSECUTIVE_DB_FAILURES", 25)
 )
+
+// envInt reads an integer environment variable, falling back to def when the
+// variable is unset, empty or unparseable. A bad value is logged rather than
+// fatal: a typo in one tuning knob must not stop the sync from running.
+func envInt(key string, def int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		log.Printf("[CONFIG] %s=%q is not an integer, using default %d", key, raw, def)
+		return def
+	}
+	return v
+}
+
+// envFloat reads a float environment variable with the same fallback rules as
+// envInt.
+func envFloat(key string, def float64) float64 {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		log.Printf("[CONFIG] %s=%q is not a number, using default %.4f", key, raw, def)
+		return def
+	}
+	return v
+}
+
+// LogSyncTuning writes the resolved tuning values once at startup. Worth having
+// in the logs of every run: when a cycle behaves unexpectedly, the first question
+// is always which thresholds it actually ran with.
+func LogSyncTuning() {
+	log.Printf("[CONFIG] SYNC_ASIN_LIMIT=%d SYNC_MAX_PER_RUN=%d STALE_THRESHOLD_DAYS=%d NOT_FOUND_RETRY_DAYS=%d SALES_WORKERS=%d MAX_FAILURE_RATE=%.2f MAX_FULL_BACKFILLS=%d SALES_RETRY_PASSES=%d",
+		HourlySyncASINLimit, SyncMaxPerRun, StaleDataThresholdDays, ProductNotFoundRetryDays,
+		SalesWorkerCount, MaxFailureRate, MaxFullBackfills, SalesRetryPasses)
+
+	if StaleDataThresholdDays < ProductNotFoundRetryDays {
+		log.Printf("[CONFIG] WARNING: NOT_FOUND_RETRY_DAYS (%d) exceeds STALE_THRESHOLD_DAYS (%d) — ASINs missing from JungleScout will be skipped on the next run and only retried on the one after",
+			ProductNotFoundRetryDays, StaleDataThresholdDays)
+	}
+}
 
 // ErrorSummary tracks errors by category for smart logging
 type ErrorSummary struct {
@@ -95,7 +254,35 @@ type HourlySyncStatus struct {
 	IsRunning             bool          `json:"is_running"`
 	StoppedEarly          bool          `json:"stopped_early"`
 	StopReason            string        `json:"stop_reason,omitempty"`
+	IsManual              bool          `json:"is_manual"`
+	ManualSource          string        `json:"manual_source,omitempty"` // uploaded CSV filename
 	ErrorSummary          *ErrorSummary `json:"error_summary"`
+
+	// SalesGapASINs counts ASINs pulled in because their product data was current
+	// but their sales fetch had previously failed.
+	SalesGapASINs int `json:"sales_gap_asins"`
+
+	// LimitReached is true when selection hit SYNC_ASIN_LIMIT and the run was
+	// therefore truncated. The cap sits far above the parent set, so this means
+	// something upstream is wrong — it is an incident, not a successful full sync.
+	LimitReached bool `json:"limit_reached"`
+
+	// ThrottledPerRun is true when the run stopped at SYNC_MAX_PER_RUN. Unlike
+	// LimitReached this is a normal outcome: an operator asked for a smaller run,
+	// the remaining ASINs stay queued, and the job still exits 0.
+	ThrottledPerRun bool `json:"throttled_per_run"`
+
+	// DeferredBackfills counts never-synced ASINs whose full-year sales fetch was
+	// postponed to a later run by MAX_FULL_BACKFILLS. Their product data was still
+	// written; no data is lost, it just arrives on the next cycle.
+	DeferredBackfills int `json:"deferred_backfills"`
+
+	// RetriedASINs counts ASINs that failed on a transient error and were picked
+	// up again by the end-of-run retry pass.
+	RetriedASINs int `json:"retried_asins"`
+
+	// RecoveredASINs counts how many of those retries then succeeded.
+	RecoveredASINs int `json:"recovered_asins"`
 }
 
 // ASINSyncInfo holds information about an ASIN to sync
@@ -103,19 +290,36 @@ type ASINSyncInfo struct {
 	ASIN                  string
 	IsNew                 bool // has_product_data=false and no product_data_synced_at
 	SalesEstimateSyncedAt *time.Time
+
+	// DeferSales postpones this ASIN's sales fetch to a later run. Set by
+	// selectASINsToSync once MaxFullBackfills never-synced ASINs are already in
+	// the batch, so one run cannot pull a year of sales for tens of thousands of
+	// ASINs at once.
+	//
+	// Deferring means skipping the sales fetch entirely rather than fetching a
+	// shorter window: sales_estimate_data_synced_at must stay NULL so the next run
+	// still recognises this ASIN as needing the full year. Fetching a short window
+	// and stamping the timestamp would silently strand the missing history.
+	DeferSales bool
+
+	// SalesGapOnly marks an ASIN selected because its product data is current but
+	// its sales fetch previously failed. Product data is refetched anyway (the
+	// product call is batched, so including it is nearly free) but the reason it
+	// is in the run is the sales gap.
+	SalesGapOnly bool
 }
 
 // SalesDataPoint holds data for a single sales data point for batch insert
 type SalesDataPoint struct {
-	ASIN             string
-	Marketplace      string
-	IsParent         bool
-	IsVariant        bool
-	IsStandalone     bool
-	ParentASIN       *string
-	Date             string
-	EstimatedUnits   int
-	LastKnownPrice   float64
+	ASIN           string
+	Marketplace    string
+	IsParent       bool
+	IsVariant      bool
+	IsStandalone   bool
+	ParentASIN     *string
+	Date           string
+	EstimatedUnits int
+	LastKnownPrice float64
 }
 
 // HourlySyncManager manages the hourly incremental sync process
@@ -128,14 +332,328 @@ type HourlySyncManager struct {
 	stopRequested    bool
 	apiCallCount     int
 	debugMode        bool // When true, prints verbose logs
+
+	// Table names used by the parent -> child fan-out, resolved once per run.
+	// prodTables stays zero when running staging-only.
+	stagingTables syncTables
+	prodTables    syncTables
+
+	// Manual mode (is_manual=true): the ASINs come from an uploaded CSV instead
+	// of the cleanup/add-new/select pipeline. They are treated as parent ASINs
+	// and are NOT capped at HourlySyncASINLimit — the CSV decides the workload.
+	isManual     bool
+	manualASINs  []string
+	manualSource string // uploaded CSV filename, for logs and status
+
+	// Transient sales failures collected during the main pass and retried once it
+	// finishes. Only plausibly temporary failures go in here — rate limits,
+	// network errors, timeouts. A 422 MISSING_RANK_DATA, or an ASIN JungleScout
+	// does not know about, is a real answer rather than a transient error, and
+	// retrying it only burns quota.
+	retryMutex  sync.Mutex
+	retryQueue  []ASINSyncInfo
+	inRetryPass bool // true while draining retryQueue, so retries do not re-queue
+
+	// consecutiveDBFailures counts database write failures with no success in
+	// between. Read and written atomically from the sales worker pool. See
+	// noteDBFailure for why a streak, rather than a single failure, ends the run.
+	consecutiveDBFailures int32
+
+	// Per-ASIN accounting. The retry pass runs the same syncSelectedASINs path as
+	// the main pass, so plain counters would count an ASIN twice — once when it
+	// failed and again when it was retried — and the failure-rate gate in cmd/job
+	// divides one counter by the other. Membership sets make the totals exact
+	// regardless of how many times an ASIN is attempted.
+	countMutex   sync.Mutex
+	processedSet map[string]bool // every ASIN attempted at least once
+	failedSet    map[string]bool // ASINs whose latest attempt did not succeed
+	productOKSet map[string]bool // ASINs with a product row written this run
+	salesOKSet   map[string]bool // ASINs with sales data written this run
+}
+
+// markProductStored records ASINs whose product row was written. Set-based so the
+// retry pass, which re-runs the same product call, cannot inflate the count.
+func (m *HourlySyncManager) markProductStored(asins ...string) {
+	m.countMutex.Lock()
+	defer m.countMutex.Unlock()
+
+	if m.productOKSet == nil {
+		m.productOKSet = make(map[string]bool)
+	}
+	for _, asin := range asins {
+		m.productOKSet[asin] = true
+	}
+
+	m.statusMutex.Lock()
+	m.status.SuccessfulProductSync = len(m.productOKSet)
+	m.statusMutex.Unlock()
+}
+
+// markSalesStored records ASINs whose sales data was written, and reports whether
+// this ASIN is newly counted (false when a retry re-stored data already counted).
+func (m *HourlySyncManager) markSalesStored(asin string) bool {
+	m.countMutex.Lock()
+	defer m.countMutex.Unlock()
+
+	if m.salesOKSet == nil {
+		m.salesOKSet = make(map[string]bool)
+	}
+	fresh := !m.salesOKSet[asin]
+	m.salesOKSet[asin] = true
+
+	m.statusMutex.Lock()
+	m.status.SuccessfulSalesSync = len(m.salesOKSet)
+	m.statusMutex.Unlock()
+	return fresh
+}
+
+// markASINAttempted records that an ASIN was attempted. Counting distinct ASINs
+// keeps TotalASINsProcessed equal to the size of the workload even when the retry
+// pass re-attempts some of them.
+func (m *HourlySyncManager) markASINAttempted(asins ...string) {
+	m.countMutex.Lock()
+	defer m.countMutex.Unlock()
+
+	if m.processedSet == nil {
+		m.processedSet = make(map[string]bool)
+	}
+	for _, asin := range asins {
+		m.processedSet[asin] = true
+	}
+
+	m.statusMutex.Lock()
+	m.status.TotalASINsProcessed = len(m.processedSet)
+	m.statusMutex.Unlock()
+}
+
+// markASINFailed records an ASIN as currently failed. Idempotent: failing twice
+// counts once.
+func (m *HourlySyncManager) markASINFailed(asins ...string) {
+	m.countMutex.Lock()
+	defer m.countMutex.Unlock()
+
+	if m.failedSet == nil {
+		m.failedSet = make(map[string]bool)
+	}
+	for _, asin := range asins {
+		m.failedSet[asin] = true
+	}
+
+	m.statusMutex.Lock()
+	m.status.FailedASINs = len(m.failedSet)
+	m.statusMutex.Unlock()
+}
+
+// markASINResolved clears a previously recorded failure, so an ASIN recovered by
+// the retry pass stops counting against the run.
+func (m *HourlySyncManager) markASINResolved(asins ...string) {
+	m.countMutex.Lock()
+	defer m.countMutex.Unlock()
+
+	if m.failedSet == nil {
+		return
+	}
+	for _, asin := range asins {
+		delete(m.failedSet, asin)
+	}
+
+	m.statusMutex.Lock()
+	m.status.FailedASINs = len(m.failedSet)
+	m.statusMutex.Unlock()
+}
+
+// isRetryPass reports whether the run is currently draining the retry queue.
+func (m *HourlySyncManager) isRetryPass() bool {
+	m.retryMutex.Lock()
+	defer m.retryMutex.Unlock()
+	return m.inRetryPass
+}
+
+// queueForRetry records an ASIN whose sales fetch failed on what looks like a
+// transient error, for the end-of-run retry pass. Calls made during the retry
+// pass itself are ignored so a persistently failing ASIN cannot loop.
+func (m *HourlySyncManager) queueForRetry(info ASINSyncInfo) {
+	if SalesRetryPasses <= 0 {
+		return
+	}
+	m.retryMutex.Lock()
+	defer m.retryMutex.Unlock()
+	if m.inRetryPass {
+		return
+	}
+	m.retryQueue = append(m.retryQueue, info)
+}
+
+// takeRetryQueue returns the queued ASINs and clears the queue.
+func (m *HourlySyncManager) takeRetryQueue() []ASINSyncInfo {
+	m.retryMutex.Lock()
+	defer m.retryMutex.Unlock()
+	queued := m.retryQueue
+	m.retryQueue = nil
+	return queued
+}
+
+// noteDBFailure records one database write failure and reports whether the run
+// should now be abandoned. A single failure is not fatal: the writes are
+// idempotent upserts, so the ASIN can simply be retried. Only a sustained streak
+// — MaxConsecutiveDBFailures in a row with no success in between — is treated as
+// the database being gone, at which point continuing would just log the same
+// error tens of thousands of times.
+func (m *HourlySyncManager) noteDBFailure(context string, err error) bool {
+	streak := atomic.AddInt32(&m.consecutiveDBFailures, 1)
+
+	if int(streak) < MaxConsecutiveDBFailures {
+		m.debugLog("[DB] %s failed (%d consecutive): %v", context, streak, err)
+		return false
+	}
+
+	msg := fmt.Sprintf("%d consecutive database failures — abandoning the run (last: %s: %v)", streak, context, err)
+	log.Printf("%s CRITICAL: %s", m.logPrefix(), msg)
+	m.addHourlyError("db", msg)
+	m.stopRequested = true
+	m.statusMutex.Lock()
+	if m.status.StopReason == "" {
+		m.status.StopReason = msg
+	}
+	m.statusMutex.Unlock()
+	return true
+}
+
+// noteDBSuccess clears the consecutive-failure streak.
+func (m *HourlySyncManager) noteDBSuccess() {
+	atomic.StoreInt32(&m.consecutiveDBFailures, 0)
+}
+
+// isTransientAPIError reports whether an error from the JungleScout client is
+// worth retrying. The client already retries a 429 three times internally and
+// then gives up with "max retries exceeded", so reaching here means the whole
+// budget was spent — exactly the case the end-of-run pass exists for, since by
+// then the rate window has usually moved on.
+//
+// Deliberately NOT retried: 422 MISSING_RANK_DATA (a normal JungleScout answer
+// for an ASIN with no rank data) and 4xx responses other than 429, which describe
+// the request rather than the moment.
+func isTransientAPIError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+
+	for _, notTransient := range []string{"missing_rank_data", "422"} {
+		if strings.Contains(msg, notTransient) {
+			return false
+		}
+	}
+
+	for _, transient := range []string{
+		"max retries exceeded",
+		"429",
+		"too many requests",
+		"timeout",
+		"timed out",
+		"connection reset",
+		"connection refused",
+		"eof",
+		"no such host",
+		"i/o timeout",
+		"temporary failure",
+		"502", "503", "504",
+	} {
+		if strings.Contains(msg, transient) {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveFanOutTables resolves and caches the table names used by the parent ->
+// child fan-out for both databases. Called once at the start of a run.
+func (m *HourlySyncManager) resolveFanOutTables() error {
+	tables, err := resolveSyncTables(m.stagingClient)
+	if err != nil {
+		return fmt.Errorf("staging: %w", err)
+	}
+	m.stagingTables = tables
+
+	if m.productionClient != nil {
+		prodTables, err := resolveSyncTables(m.productionClient)
+		if err != nil {
+			return fmt.Errorf("production: %w", err)
+		}
+		m.prodTables = prodTables
+	}
+	return nil
+}
+
+// logPrefix tags every line of a run so a manual run can be grepped out of the
+// hourly cron noise in production logs.
+func (m *HourlySyncManager) logPrefix() string {
+	if m.isManual {
+		return "[HOURLY_SYNC][MANUAL]"
+	}
+	return "[HOURLY_SYNC]"
 }
 
 // debugLog prints a log message only if debug mode is enabled
 func (m *HourlySyncManager) debugLog(format string, args ...interface{}) {
 	if m.debugMode {
 		msg := fmt.Sprintf(format, args...)
-		log.Printf("[HOURLY_SYNC] %s", msg)
+		log.Printf("%s %s", m.logPrefix(), msg)
 	}
+}
+
+// monitorLog prints a log message that is ALWAYS emitted for a manual run, and
+// only under debug for the automatic cron run.
+//
+// A manual run is human-triggered against production and the caller needs to be
+// able to prove, from the logs alone, which ASINs were sent to JungleScout and
+// which database they were written to. The hourly cron runs unattended every
+// hour, so its log volume is left as it was.
+func (m *HourlySyncManager) monitorLog(format string, args ...interface{}) {
+	if !m.isManual && !m.debugMode {
+		return
+	}
+	log.Printf("%s %s", m.logPrefix(), fmt.Sprintf(format, args...))
+}
+
+// logASINList prints a full ASIN list in chunks so no ASIN is hidden behind a
+// truncated log line. Used to evidence exactly what went to JungleScout.
+func (m *HourlySyncManager) logASINList(label string, asins []string) {
+	const perLine = 20
+	m.monitorLog("%s (%d):", label, len(asins))
+	for i := 0; i < len(asins); i += perLine {
+		end := i + perLine
+		if end > len(asins) {
+			end = len(asins)
+		}
+		m.monitorLog("  [%04d-%04d] %s", i+1, end, strings.Join(asins[i:end], " "))
+	}
+}
+
+// logTargetDatabases records which databases this run will touch, resolved from
+// the connections themselves rather than from config, so a production run can
+// be verified from its logs.
+func (m *HourlySyncManager) logTargetDatabases() {
+	describe := func(client *database.PostgreSQLClient) string {
+		if client == nil {
+			return "none"
+		}
+		var dbName, dbUser, host string
+		err := client.DB.QueryRow(
+			`SELECT current_database(), current_user, COALESCE(inet_server_addr()::text, 'local')`,
+		).Scan(&dbName, &dbUser, &host)
+		if err != nil {
+			return fmt.Sprintf("unknown (identity query failed: %v, prefix=%q)", err, client.TablePrefix)
+		}
+		return fmt.Sprintf("db=%s user=%s host=%s prefix=%q", dbName, dbUser, host, client.TablePrefix)
+	}
+
+	m.monitorLog("Target STAGING     : %s", describe(m.stagingClient))
+	if m.productionClient == nil {
+		m.monitorLog("Target PRODUCTION  : none (STAGING-ONLY MODE - no production writes)")
+		return
+	}
+	m.monitorLog("Target PRODUCTION  : %s", describe(m.productionClient))
 }
 
 var (
@@ -173,8 +691,29 @@ func NewMasterSyncManager(stagingClient, productionClient *database.PostgreSQLCl
 }
 
 // JSMasterSync handles the master synchronization of all ASINs
+//
+// Query/form params:
+//   - marketplace: Amazon marketplace (default: "us")
+//   - date_range:  "1month" or "1year" (default: "1month")
+//   - sync_mode:   "fresh" or "resume" (default: "fresh")
+//   - is_manual:   "true" to take the parent ASINs from an uploaded CSV instead
+//     of the database selection. Requires a multipart/form-data
+//     upload in field "file" (see jsmanual_asins.go).
 func JSMasterSync(stagingClient, productionClient *database.PostgreSQLClient, recorder junglescout.APIUsageRecorder) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// Manual mode: parse and validate the CSV BEFORE claiming the global sync
+		// manager, so a bad upload cannot leave a half-configured run behind.
+		isManual := isManualRequested(c)
+		var upload *ManualASINUpload
+		if isManual {
+			parsed, err := readManualASINUpload(c)
+			if err != nil {
+				c.JSON(400, gin.H{"error": err.Error()})
+				return
+			}
+			upload = parsed
+		}
+
 		// Check if sync is already running
 		syncManagerMutex.Lock()
 		if globalSyncManager != nil && globalSyncManager.status != nil && globalSyncManager.status.IsRunning {
@@ -188,20 +727,26 @@ func JSMasterSync(stagingClient, productionClient *database.PostgreSQLClient, re
 
 		// Create new sync manager with both clients
 		globalSyncManager = NewMasterSyncManager(stagingClient, productionClient, recorder)
+		if isManual {
+			globalSyncManager.isManual = true
+			globalSyncManager.manualASINs = upload.ASINs
+			globalSyncManager.manualSource = upload.Filename
+		}
 		syncManagerMutex.Unlock()
 
-		// Get query parameters
-		marketplace := c.DefaultQuery("marketplace", "us")
-		dateRange := c.DefaultQuery("date_range", "1month") // Default to 1 month
+		// Get parameters (query string, falling back to the multipart form so a
+		// manual run can send everything in one body)
+		marketplace := paramOrDefault(c, "marketplace", "us")
+		dateRange := paramOrDefault(c, "date_range", "1month") // Default to 1 month
 
 		// Sync mode determines how to handle existing data
 		// "fresh" - Reset all flags and fetch fresh data for all ASINs (default for scheduled syncs)
 		// "resume" - Continue from where it left off (for failed syncs)
 		// "force" - Same as fresh (kept for backward compatibility)
-		syncMode := c.DefaultQuery("sync_mode", "fresh")
+		syncMode := paramOrDefault(c, "sync_mode", "fresh")
 
 		// Handle legacy force_resync parameter
-		forceResync := c.DefaultQuery("force_resync", "false") == "true"
+		forceResync := paramOrDefault(c, "force_resync", "false") == "true"
 		if forceResync {
 			syncMode = "fresh"
 		}
@@ -228,12 +773,19 @@ func JSMasterSync(stagingClient, productionClient *database.PostgreSQLClient, re
 		// Start sync in background
 		go globalSyncManager.RunSync(marketplace, syncMode)
 
-		c.JSON(200, gin.H{
+		response := gin.H{
 			"message":    "Master sync started",
 			"status":     globalSyncManager.GetStatus(),
 			"date_range": dateRange,
 			"sync_mode":  syncMode,
-		})
+			"is_manual":  isManual,
+		}
+		if isManual {
+			response["message"] = fmt.Sprintf("Master sync started for %d ASINs from the uploaded CSV", len(upload.ASINs))
+			response["upload"] = upload
+		}
+
+		c.JSON(200, response)
 	}
 }
 
@@ -263,14 +815,16 @@ func (m *MasterSyncManager) RunSync(marketplace string, syncMode string) {
 	// Initialize status
 	m.statusMutex.Lock()
 	m.status = &SyncStatus{
-		StartedAt: time.Now(),
-		IsRunning: true,
-		DateRange: m.dateRange,
-		Errors:    []string{},
+		StartedAt:    time.Now(),
+		IsRunning:    true,
+		DateRange:    m.dateRange,
+		IsManual:     m.isManual,
+		ManualSource: m.manualSource,
+		Errors:       []string{},
 	}
 	m.statusMutex.Unlock()
 
-	m.logger.Printf("Starting sync with date range: %s, mode: %s", m.dateRange, syncMode)
+	m.logger.Printf("Starting sync with date range: %s, mode: %s, manual: %v", m.dateRange, syncMode, m.isManual)
 
 	defer func() {
 		// Mark sync as completed
@@ -303,12 +857,29 @@ func (m *MasterSyncManager) RunSync(marketplace string, syncMode string) {
 		m.sendDiscordNotification(syncMode)
 	}()
 
-	// Step 1: Fetch all ASINs from active products table where visibility=true
-	asins, err := m.fetchActiveASINs()
-	if err != nil {
-		m.addError(fmt.Sprintf("Failed to fetch ASINs: %v", err))
-		m.logger.Printf("Error fetching ASINs: %v", err)
+	// Step 0: Resolve the table names the parent/child fan-out needs, once per run
+	if err := m.resolveFanOutTables(); err != nil {
+		m.addError(fmt.Sprintf("Failed to resolve fan-out tables: %v", err))
+		m.logger.Printf("Error resolving fan-out tables: %v", err)
 		return
+	}
+
+	// Step 1: Determine the PARENT ASINs to sync (children are filled in by
+	// fan-out). In manual mode the uploaded CSV *is* the parent set, so the
+	// database selection is skipped entirely.
+	var asins []string
+	if m.isManual {
+		asins = m.manualASINs
+		m.logger.Printf("MANUAL MODE: using %d parent ASINs from uploaded CSV %q (database ASIN selection skipped)",
+			len(asins), m.manualSource)
+	} else {
+		var err error
+		asins, err = m.fetchParentASINsToSync()
+		if err != nil {
+			m.addError(fmt.Sprintf("Failed to fetch parent ASINs: %v", err))
+			m.logger.Printf("Error fetching parent ASINs: %v", err)
+			return
+		}
 	}
 
 	m.statusMutex.Lock()
@@ -316,7 +887,7 @@ func (m *MasterSyncManager) RunSync(marketplace string, syncMode string) {
 	m.status.TotalBatches = (len(asins) + 99) / 100 // Calculate total batches (100 ASINs per batch)
 	m.statusMutex.Unlock()
 
-	m.logger.Printf("Found %d ASINs to sync", len(asins))
+	m.logger.Printf("Found %d parent ASINs to sync (children are copied from their parent)", len(asins))
 
 	// Step 2: Initialize or update asin_sync_status table
 	if err := m.initializeASINSyncStatus(asins, syncMode); err != nil {
@@ -332,20 +903,39 @@ func (m *MasterSyncManager) RunSync(marketplace string, syncMode string) {
 	m.syncSalesEstimateData(marketplace)
 }
 
-// fetchActiveASINs retrieves all ASINs from the active products table where visibility=true
+// resolveFanOutTables resolves and caches the table names used by the parent ->
+// child fan-out for both databases. Called once at the start of a run.
+func (m *MasterSyncManager) resolveFanOutTables() error {
+	tables, err := resolveSyncTables(m.stagingClient)
+	if err != nil {
+		return fmt.Errorf("staging: %w", err)
+	}
+	m.stagingTables = tables
+
+	if m.productionClient != nil {
+		prodTables, err := resolveSyncTables(m.productionClient)
+		if err != nil {
+			return fmt.Errorf("production: %w", err)
+		}
+		m.prodTables = prodTables
+	}
+	return nil
+}
+
+// fetchParentASINsToSync retrieves the PARENT ASINs the sync must fetch from
+// JungleScout: every distinct parent_asin in the mapping table, regardless of
+// asin_visibility. Children are never fetched directly — their data is copied
+// from the parent by the fan-out.
 // READ operation - uses stagingClient only
-func (m *MasterSyncManager) fetchActiveASINs() ([]string, error) {
-	tableName, _ := utils.GetTableName(m.stagingClient, "product")
+func (m *MasterSyncManager) fetchParentASINsToSync() ([]string, error) {
 	query := fmt.Sprintf(`
-		SELECT DISTINCT asin
-		FROM %s
-		WHERE product_visibility = true AND asin IS NOT NULL AND asin != ''
+		SELECT asin FROM (%s) src
 		ORDER BY asin
-	`, tableName)
+	`, parentASINSourceSQL(m.stagingTables))
 
 	rows, err := m.stagingClient.DB.Query(query)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query ASINs: %w", err)
+		return nil, fmt.Errorf("failed to query parent ASINs: %w", err)
 	}
 	defer rows.Close()
 
@@ -366,20 +956,71 @@ func (m *MasterSyncManager) fetchActiveASINs() ([]string, error) {
 	return asins, nil
 }
 
+// manualASINFilter returns an extra WHERE predicate restricting a
+// jungle_scout_sync_status selection to the CSV-supplied ASINs, or "" when the
+// run is not manual. param is the placeholder to bind manualASINArgs() to.
+//
+// Without it, a manual run would also pick up every ASIN some earlier automatic
+// run left with has_product_data = false, and burn JungleScout calls on them.
+func (m *MasterSyncManager) manualASINFilter(param string) string {
+	if !m.isManual {
+		return ""
+	}
+	return fmt.Sprintf("AND asin = ANY(%s::text[])", param)
+}
+
+// manualASINArgs returns the query args that go with manualASINFilter: the ASIN
+// array in manual mode, nothing otherwise.
+func (m *MasterSyncManager) manualASINArgs() []interface{} {
+	if !m.isManual {
+		return nil
+	}
+	return []interface{}{pq.Array(m.manualASINs)}
+}
+
 // initializeASINSyncStatus creates/updates entries in the jungle_scout_sync_status table
 // WRITE operation - staging first, then production with retry
 func (m *MasterSyncManager) initializeASINSyncStatus(asins []string, syncMode string) error {
 	stagingTableName := m.stagingClient.TableName("jungle_scout_sync_status")
-	productionTableName := m.productionClient.TableName("jungle_scout_sync_status")
-
-	// Resume mode: keep existing sync status, don't reset anything
-	if syncMode != "fresh" {
-		m.logger.Println("RESUME MODE: Keeping existing sync status for all ASINs")
-		return nil
+	var productionTableName string
+	if m.productionClient != nil {
+		productionTableName = m.productionClient.TableName("jungle_scout_sync_status")
 	}
 
-	// Fresh sync: reset all fields for ALL ASINs to get latest data
-	m.logger.Println("FRESH SYNC MODE: Resetting all ASINs to fetch latest data")
+	// Query used per ASIN. Fresh mode resets every flag so the ASIN is fetched
+	// again; resume mode only makes sure the row exists (manual mode only — a CSV
+	// can name ASINs that were never queued, and those would otherwise be
+	// invisible to the sync_status-driven steps that follow).
+	const freshUpsert = `
+		INSERT INTO %s (asin, has_product_data, has_sales_data, error, updated_at)
+		VALUES ($1, false, false, NULL, CURRENT_TIMESTAMP)
+		ON CONFLICT (asin) DO UPDATE SET
+			has_product_data = false,
+			has_sales_data = false,
+			error = NULL,
+			product_data_synced_at = NULL,
+			sales_estimate_data_synced_at = NULL,
+			updated_at = CURRENT_TIMESTAMP
+	`
+	const insertMissing = `
+		INSERT INTO %s (asin, has_product_data, has_sales_data, error, updated_at)
+		VALUES ($1, false, false, NULL, CURRENT_TIMESTAMP)
+		ON CONFLICT (asin) DO NOTHING
+	`
+
+	queryTemplate := freshUpsert
+	if syncMode != "fresh" {
+		// Resume mode: keep existing sync status, don't reset anything
+		if !m.isManual {
+			m.logger.Println("RESUME MODE: Keeping existing sync status for all ASINs")
+			return nil
+		}
+		m.logger.Println("RESUME MODE (manual): Keeping existing sync status, only queueing CSV ASINs that are missing")
+		queryTemplate = insertMissing
+	} else {
+		// Fresh sync: reset all fields for ALL ASINs to get latest data
+		m.logger.Printf("FRESH SYNC MODE: Resetting %d ASINs to fetch latest data", len(asins))
+	}
 
 	// Helper function to run transaction on a database
 	runTransaction := func(db *sql.DB, tableName string, dbName string) error {
@@ -389,17 +1030,7 @@ func (m *MasterSyncManager) initializeASINSyncStatus(asins []string, syncMode st
 		}
 		defer tx.Rollback()
 
-		upsertQuery := fmt.Sprintf(`
-			INSERT INTO %s (asin, has_product_data, has_sales_data, error, updated_at)
-			VALUES ($1, false, false, NULL, CURRENT_TIMESTAMP)
-			ON CONFLICT (asin) DO UPDATE SET
-				has_product_data = false,
-				has_sales_data = false,
-				error = NULL,
-				product_data_synced_at = NULL,
-				sales_estimate_data_synced_at = NULL,
-				updated_at = CURRENT_TIMESTAMP
-		`, tableName)
+		upsertQuery := fmt.Sprintf(queryTemplate, tableName)
 
 		stmt, err := tx.Prepare(upsertQuery)
 		if err != nil {
@@ -424,6 +1055,11 @@ func (m *MasterSyncManager) initializeASINSyncStatus(asins []string, syncMode st
 		return err
 	}
 	m.logger.Println("Staging sync status initialized successfully")
+
+	// Staging-only mode: no production client, nothing more to do.
+	if m.productionClient == nil {
+		return nil
+	}
 
 	// Step 2: Write to PRODUCTION with retry (3 attempts)
 	var prodErr error
@@ -454,23 +1090,27 @@ func (m *MasterSyncManager) syncProductData(allASINs []string, marketplace strin
 		m.addError(fmt.Sprintf("Staging database unreachable: %v", err))
 		return
 	}
-	if err := m.productionClient.DB.Ping(); err != nil {
-		m.logger.Printf("CRITICAL: Production database connection failed before product sync: %v", err)
-		m.stopRequested = true
-		m.addError(fmt.Sprintf("Production database unreachable: %v", err))
-		return
+	if m.productionClient != nil {
+		if err := m.productionClient.DB.Ping(); err != nil {
+			m.logger.Printf("CRITICAL: Production database connection failed before product sync: %v", err)
+			m.stopRequested = true
+			m.addError(fmt.Sprintf("Production database unreachable: %v", err))
+			return
+		}
 	}
 
-	// Filter ASINs to only those that need product data sync (READ from staging)
+	// Filter ASINs to only those that need product data sync (READ from staging).
+	// In manual mode the selection is additionally scoped to the uploaded ASINs.
 	statusTableName := m.stagingClient.TableName("jungle_scout_sync_status")
 	query := fmt.Sprintf(`
 		SELECT asin
 		FROM %s
-		WHERE has_product_data = false OR has_product_data IS NULL
+		WHERE (has_product_data = false OR has_product_data IS NULL)
+		%s
 		ORDER BY asin
-	`, statusTableName)
+	`, statusTableName, m.manualASINFilter("$1"))
 
-	rows, err := m.stagingClient.DB.Query(query)
+	rows, err := m.stagingClient.DB.Query(query, m.manualASINArgs()...)
 	if err != nil {
 		m.logger.Printf("CRITICAL: Failed to fetch ASINs needing product sync: %v", err)
 		m.stopRequested = true
@@ -582,8 +1222,11 @@ func (m *MasterSyncManager) storeProductData(apiResponse *junglescout.ProductAPI
 	// Table names for both databases
 	stagingProductTable := m.stagingClient.TableName("jungle_scout_product_data")
 	stagingStatusTable := m.stagingClient.TableName("jungle_scout_sync_status")
-	prodProductTable := m.productionClient.TableName("jungle_scout_product_data")
-	prodStatusTable := m.productionClient.TableName("jungle_scout_sync_status")
+	var prodProductTable, prodStatusTable string
+	if m.productionClient != nil {
+		prodProductTable = m.productionClient.TableName("jungle_scout_product_data")
+		prodStatusTable = m.productionClient.TableName("jungle_scout_sync_status")
+	}
 	reportDate := time.Now().Format("2006-01-02")
 
 	// Build query template (table name will be substituted)
@@ -739,30 +1382,50 @@ func (m *MasterSyncManager) storeProductData(apiResponse *junglescout.ProductAPI
 			break
 		}
 
-		// Step 2: Write to PRODUCTION with retry (3 attempts)
-		var prodErr error
-		for attempt := 1; attempt <= 3; attempt++ {
-			_, prodErr = m.productionClient.DB.Exec(buildProductQuery(prodProductTable), productArgs...)
-			if prodErr == nil {
-				// Update production sync status
-				_, prodErr = m.productionClient.DB.Exec(buildStatusQuery(prodStatusTable), asin, true, nil, time.Now())
+		// Step 2: Write to PRODUCTION with retry (3 attempts).
+		// Skipped entirely when running staging-only (no production client).
+		if m.productionClient != nil {
+			var prodErr error
+			for attempt := 1; attempt <= 3; attempt++ {
+				_, prodErr = m.productionClient.DB.Exec(buildProductQuery(prodProductTable), productArgs...)
 				if prodErr == nil {
-					break
+					// Update production sync status
+					_, prodErr = m.productionClient.DB.Exec(buildStatusQuery(prodStatusTable), asin, true, nil, time.Now())
+					if prodErr == nil {
+						break
+					}
+				}
+				m.logger.Printf("Production write attempt %d for ASIN %s failed: %v", attempt, asin, prodErr)
+				if attempt < 3 {
+					time.Sleep(time.Duration(attempt) * time.Second)
 				}
 			}
-			m.logger.Printf("Production write attempt %d for ASIN %s failed: %v", attempt, asin, prodErr)
-			if attempt < 3 {
-				time.Sleep(time.Duration(attempt) * time.Second)
+
+			if prodErr != nil {
+				m.logger.Printf("CRITICAL: Failed to store product data for ASIN %s on production after 3 retries: %v", asin, prodErr)
+				m.productionClient.DB.Exec(buildStatusQuery(prodStatusTable), asin, false, fmt.Sprintf("Failed to store product data after 3 retries: %v", prodErr), nil)
+				criticalError = prodErr
+				m.stopRequested = true
+				m.addError(fmt.Sprintf("Production database failure storing ASIN %s: %v", asin, prodErr))
+				break
 			}
 		}
 
-		if prodErr != nil {
-			m.logger.Printf("CRITICAL: Failed to store product data for ASIN %s on production after 3 retries: %v", asin, prodErr)
-			m.productionClient.DB.Exec(buildStatusQuery(prodStatusTable), asin, false, fmt.Sprintf("Failed to store product data after 3 retries: %v", prodErr), nil)
-			criticalError = prodErr
-			m.stopRequested = true
-			m.addError(fmt.Sprintf("Production database failure storing ASIN %s: %v", asin, prodErr))
-			break
+		// Step 3: Copy this parent's row onto every child.
+		// A fan-out failure is NOT critical: the parent row is already stored and
+		// the API call is not wasted, so log it and keep going.
+		if childRows, fanErr := fanOutProductRow(m.stagingClient, m.stagingTables, asin, reportDate); fanErr != nil {
+			m.logger.Printf("WARNING: staging %v", fanErr)
+			m.addError(fmt.Sprintf("Staging product fan-out failed for parent %s: %v", asin, fanErr))
+		} else if childRows > 0 {
+			m.logger.Printf("Copied product data for parent %s to %d child ASINs", asin, childRows)
+		}
+
+		if m.productionClient != nil {
+			if _, fanErr := fanOutProductRow(m.productionClient, m.prodTables, asin, reportDate); fanErr != nil {
+				m.logger.Printf("WARNING: production %v", fanErr)
+				m.addError(fmt.Sprintf("Production product fan-out failed for parent %s: %v", asin, fanErr))
+			}
 		}
 
 		successCount++
@@ -790,23 +1453,27 @@ func (m *MasterSyncManager) syncSalesEstimateData(marketplace string) {
 		m.addError(fmt.Sprintf("Staging database unreachable: %v", err))
 		return
 	}
-	if err := m.productionClient.DB.Ping(); err != nil {
-		m.logger.Printf("CRITICAL: Production database connection failed before sales sync: %v", err)
-		m.stopRequested = true
-		m.addError(fmt.Sprintf("Production database unreachable: %v", err))
-		return
+	if m.productionClient != nil {
+		if err := m.productionClient.DB.Ping(); err != nil {
+			m.logger.Printf("CRITICAL: Production database connection failed before sales sync: %v", err)
+			m.stopRequested = true
+			m.addError(fmt.Sprintf("Production database unreachable: %v", err))
+			return
+		}
 	}
 
-	// Get ASINs that have product data but no sales data (READ from staging)
+	// Get ASINs that have product data but no sales data (READ from staging).
+	// In manual mode the selection is additionally scoped to the uploaded ASINs.
 	statusTableName := m.stagingClient.TableName("jungle_scout_sync_status")
 	query := fmt.Sprintf(`
 		SELECT asin
 		FROM %s
 		WHERE has_product_data = true AND has_sales_data = false
+		%s
 		ORDER BY asin
-	`, statusTableName)
+	`, statusTableName, m.manualASINFilter("$1"))
 
-	rows, err := m.stagingClient.DB.Query(query)
+	rows, err := m.stagingClient.DB.Query(query, m.manualASINArgs()...)
 	if err != nil {
 		m.addError(fmt.Sprintf("Failed to fetch ASINs for sales sync: %v", err))
 		m.logger.Printf("Error fetching ASINs for sales sync: %v", err)
@@ -928,8 +1595,11 @@ func (m *MasterSyncManager) storeSalesEstimateData(apiResponse *junglescout.Sale
 	// Table names for both databases
 	stagingSalesTable := m.stagingClient.TableName("jungle_scout_sales_estimate_data")
 	stagingStatusTable := m.stagingClient.TableName("jungle_scout_sync_status")
-	prodSalesTable := m.productionClient.TableName("jungle_scout_sales_estimate_data")
-	prodStatusTable := m.productionClient.TableName("jungle_scout_sync_status")
+	var prodSalesTable, prodStatusTable string
+	if m.productionClient != nil {
+		prodSalesTable = m.productionClient.TableName("jungle_scout_sales_estimate_data")
+		prodStatusTable = m.productionClient.TableName("jungle_scout_sync_status")
+	}
 
 	// Process the first (and only) data item
 	jsData := apiResponse.Data[0]
@@ -989,34 +1659,55 @@ func (m *MasterSyncManager) storeSalesEstimateData(apiResponse *junglescout.Sale
 			return false
 		}
 
-		// Step 2: Write to PRODUCTION with retry (3 attempts)
-		var prodErr error
-		for attempt := 1; attempt <= 3; attempt++ {
-			_, prodErr = m.productionClient.DB.Exec(buildSalesQuery(prodSalesTable), args...)
-			if prodErr == nil {
-				break
+		// Step 2: Write to PRODUCTION with retry (3 attempts).
+		// Skipped entirely when running staging-only (no production client).
+		if m.productionClient != nil {
+			var prodErr error
+			for attempt := 1; attempt <= 3; attempt++ {
+				_, prodErr = m.productionClient.DB.Exec(buildSalesQuery(prodSalesTable), args...)
+				if prodErr == nil {
+					break
+				}
+				m.logger.Printf("Production write attempt %d for ASIN %s date %s failed: %v", attempt, attrs.ASIN, dataPoint.Date, prodErr)
+				if attempt < 3 {
+					time.Sleep(time.Duration(attempt) * time.Second)
+				}
 			}
-			m.logger.Printf("Production write attempt %d for ASIN %s date %s failed: %v", attempt, attrs.ASIN, dataPoint.Date, prodErr)
-			if attempt < 3 {
-				time.Sleep(time.Duration(attempt) * time.Second)
+
+			if prodErr != nil {
+				m.logger.Printf("CRITICAL: Failed to insert sales data for ASIN %s, date %s on production after 3 retries: %v",
+					attrs.ASIN, dataPoint.Date, prodErr)
+				failCount++
+				lastError = prodErr
+
+				// Stop on production failure after retries
+				m.addError(fmt.Sprintf("Production database critical failure for ASIN %s: %v", attrs.ASIN, prodErr))
+				m.stopRequested = true
+				m.updateASINSyncStatus(attrs.ASIN, true, false,
+					fmt.Sprintf("Critical production DB error after 3 retries: %v", prodErr))
+				return false
 			}
-		}
-
-		if prodErr != nil {
-			m.logger.Printf("CRITICAL: Failed to insert sales data for ASIN %s, date %s on production after 3 retries: %v",
-				attrs.ASIN, dataPoint.Date, prodErr)
-			failCount++
-			lastError = prodErr
-
-			// Stop on production failure after retries
-			m.addError(fmt.Sprintf("Production database critical failure for ASIN %s: %v", attrs.ASIN, prodErr))
-			m.stopRequested = true
-			m.updateASINSyncStatus(attrs.ASIN, true, false,
-				fmt.Sprintf("Critical production DB error after 3 retries: %v", prodErr))
-			return false
 		}
 
 		successCount++
+	}
+
+	// Copy every sales row of this parent onto its children.
+	// Non-critical: the parent rows are stored and the API call is not wasted.
+	if successCount > 0 {
+		if childRows, fanErr := fanOutSalesRows(m.stagingClient, m.stagingTables, attrs.ASIN, marketplace, ""); fanErr != nil {
+			m.logger.Printf("WARNING: staging %v", fanErr)
+			m.addError(fmt.Sprintf("Staging sales fan-out failed for parent %s: %v", attrs.ASIN, fanErr))
+		} else if childRows > 0 {
+			m.logger.Printf("Copied %d sales rows from parent %s to its child ASINs", childRows, attrs.ASIN)
+		}
+
+		if m.productionClient != nil {
+			if _, fanErr := fanOutSalesRows(m.productionClient, m.prodTables, attrs.ASIN, marketplace, ""); fanErr != nil {
+				m.logger.Printf("WARNING: production %v", fanErr)
+				m.addError(fmt.Sprintf("Production sales fan-out failed for parent %s: %v", attrs.ASIN, fanErr))
+			}
+		}
 	}
 
 	// Update sync status based on results (dual-write)
@@ -1037,19 +1728,21 @@ func (m *MasterSyncManager) storeSalesEstimateData(apiResponse *junglescout.Sale
 			m.logger.Printf("Failed to update staging sync status for ASIN %s: %v", attrs.ASIN, err)
 		}
 
-		// Update production status with retry
-		var prodErr error
-		for attempt := 1; attempt <= 3; attempt++ {
-			_, prodErr = m.productionClient.DB.Exec(buildSuccessStatusQuery(prodStatusTable), attrs.ASIN)
-			if prodErr == nil {
-				break
+		// Update production status with retry (skipped when staging-only)
+		if m.productionClient != nil {
+			var prodErr error
+			for attempt := 1; attempt <= 3; attempt++ {
+				_, prodErr = m.productionClient.DB.Exec(buildSuccessStatusQuery(prodStatusTable), attrs.ASIN)
+				if prodErr == nil {
+					break
+				}
+				if attempt < 3 {
+					time.Sleep(time.Duration(attempt) * time.Second)
+				}
 			}
-			if attempt < 3 {
-				time.Sleep(time.Duration(attempt) * time.Second)
+			if prodErr != nil {
+				m.logger.Printf("Failed to update production sync status for ASIN %s after 3 retries: %v", attrs.ASIN, prodErr)
 			}
-		}
-		if prodErr != nil {
-			m.logger.Printf("Failed to update production sync status for ASIN %s after 3 retries: %v", attrs.ASIN, prodErr)
 		}
 
 		m.logger.Printf("Sales data for ASIN %s: %d/%d succeeded, %d failed",
@@ -1069,7 +1762,9 @@ func (m *MasterSyncManager) storeSalesEstimateData(apiResponse *junglescout.Sale
 
 	errorMsg := fmt.Sprintf("Failed to sync all %d records. Last error: %v", len(attrs.Data), lastError)
 	m.stagingClient.DB.Exec(buildErrorStatusQuery(stagingStatusTable), attrs.ASIN, errorMsg)
-	m.productionClient.DB.Exec(buildErrorStatusQuery(prodStatusTable), attrs.ASIN, errorMsg)
+	if m.productionClient != nil {
+		m.productionClient.DB.Exec(buildErrorStatusQuery(prodStatusTable), attrs.ASIN, errorMsg)
+	}
 
 	m.logger.Printf("Failed to sync any sales data for ASIN %s", attrs.ASIN)
 	return false
@@ -1079,7 +1774,10 @@ func (m *MasterSyncManager) storeSalesEstimateData(apiResponse *junglescout.Sale
 // WRITE operation - staging first, then production with retry
 func (m *MasterSyncManager) updateASINSyncStatus(asin string, hasProductData, hasSalesData bool, errorMsg string) {
 	stagingStatusTable := m.stagingClient.TableName("jungle_scout_sync_status")
-	prodStatusTable := m.productionClient.TableName("jungle_scout_sync_status")
+	var prodStatusTable string
+	if m.productionClient != nil {
+		prodStatusTable = m.productionClient.TableName("jungle_scout_sync_status")
+	}
 
 	buildQuery := func(tableName string, hasError bool) string {
 		if hasError {
@@ -1115,7 +1813,10 @@ func (m *MasterSyncManager) updateASINSyncStatus(asin string, hasProductData, ha
 		m.logger.Printf("Failed to update staging sync status for ASIN %s: %v", asin, err)
 	}
 
-	// Step 2: Write to PRODUCTION with retry (3 attempts)
+	// Step 2: Write to PRODUCTION with retry (skipped when staging-only)
+	if m.productionClient == nil {
+		return
+	}
 	var prodErr error
 	for attempt := 1; attempt <= 3; attempt++ {
 		_, prodErr = m.productionClient.DB.Exec(buildQuery(prodStatusTable, hasError), args...)
@@ -1136,7 +1837,10 @@ func (m *MasterSyncManager) updateASINSyncStatus(asin string, hasProductData, ha
 // WRITE operation - staging first, then production with retry
 func (m *MasterSyncManager) updateBatchError(asins []string, errorMsg string) {
 	stagingStatusTable := m.stagingClient.TableName("jungle_scout_sync_status")
-	prodStatusTable := m.productionClient.TableName("jungle_scout_sync_status")
+	var prodStatusTable string
+	if m.productionClient != nil {
+		prodStatusTable = m.productionClient.TableName("jungle_scout_sync_status")
+	}
 
 	// Helper function to run batch update on a database
 	runBatchUpdate := func(db *sql.DB, tableName string, dbName string) error {
@@ -1174,7 +1878,10 @@ func (m *MasterSyncManager) updateBatchError(asins []string, errorMsg string) {
 		m.logger.Printf("Failed to update staging batch error: %v", err)
 	}
 
-	// Step 2: Write to PRODUCTION with retry (3 attempts)
+	// Step 2: Write to PRODUCTION with retry (skipped when staging-only)
+	if m.productionClient == nil {
+		return
+	}
 	var prodErr error
 	for attempt := 1; attempt <= 3; attempt++ {
 		prodErr = runBatchUpdate(m.productionClient.DB, prodStatusTable, "production")
@@ -1211,6 +1918,16 @@ func (m *MasterSyncManager) GetStatus() SyncStatus {
 	}
 
 	return *m.status
+}
+
+// asinSourceLabel describes where this run's parent ASINs came from.
+func (m *MasterSyncManager) asinSourceLabel() string {
+	return asinSourceLabel(m.isManual, m.manualSource)
+}
+
+// asinSourceLabel describes where this run's ASINs came from.
+func (m *HourlySyncManager) asinSourceLabel() string {
+	return asinSourceLabel(m.isManual, m.manualSource)
 }
 
 // sendDiscordNotification sends a webhook notification to Discord with sync results
@@ -1285,6 +2002,11 @@ func (m *MasterSyncManager) sendDiscordNotification(syncMode string) {
 				"value":  syncMode,
 				"inline": true,
 			},
+			{
+				"name":   "🗂️ ASIN Source",
+				"value":  m.asinSourceLabel(),
+				"inline": true,
+			},
 		},
 		"timestamp": m.status.StartedAt.Format(time.RFC3339),
 		"footer": map[string]string{
@@ -1350,7 +2072,10 @@ func (m *MasterSyncManager) execOnBothDBs(query string, args ...interface{}) err
 		return fmt.Errorf("staging: %w", err)
 	}
 
-	// Write to production with retry (3 attempts)
+	// Write to production with retry (skipped when staging-only)
+	if m.productionClient == nil {
+		return nil
+	}
 	var prodErr error
 	for attempt := 1; attempt <= 3; attempt++ {
 		if _, prodErr = m.productionClient.DB.Exec(query, args...); prodErr == nil {
@@ -1369,16 +2094,70 @@ func (m *MasterSyncManager) execOnBothDBs(query string, args ...interface{}) err
 // ============================================================================
 
 // JSHourlySync handles the hourly synchronization endpoint for cloud jobs
-// Query params:
+// (POST /admin/hourly-sync).
+//
+// Query/form params:
 //   - marketplace: Amazon marketplace (default: "us")
 //   - debug: Enable verbose logging (default: "false")
+//   - is_manual: "true" to take the ASINs from an uploaded CSV. Equivalent to
+//     calling POST /admin/hourly-sync/manual, which is the preferred
+//     entry point for a CSV-driven run.
 func JSHourlySync(stagingClient, productionClient *database.PostgreSQLClient, recorder junglescout.APIUsageRecorder) gin.HandlerFunc {
+	return runHourlySyncHandler(stagingClient, productionClient, recorder, false)
+}
+
+// JSManualHourlySync handles the manual, CSV-driven hourly sync
+// (POST /admin/hourly-sync/manual). It is the same run as JSHourlySync with
+// is_manual forced on, so the CSV is mandatory: a request without one is
+// rejected instead of silently falling back to the automatic ASIN selection.
+//
+// The uploaded ASINs are treated as parent ASINs and are NOT capped at
+// HourlySyncASINLimit, so the request runs as long as the CSV needs — keep
+// manual uploads small enough for the caller's timeout.
+//
+// Form params (multipart/form-data):
+//   - file: the CSV of parent ASINs (required, see jsmanual_asins.go)
+//   - marketplace: Amazon marketplace (default: "us")
+//   - debug: Enable verbose logging (default: "false")
+func JSManualHourlySync(stagingClient, productionClient *database.PostgreSQLClient, recorder junglescout.APIUsageRecorder) gin.HandlerFunc {
+	return runHourlySyncHandler(stagingClient, productionClient, recorder, true)
+}
+
+// runHourlySyncHandler builds the handler shared by the automatic and manual
+// hourly endpoints. forceManual makes the CSV upload mandatory.
+func runHourlySyncHandler(stagingClient, productionClient *database.PostgreSQLClient, recorder junglescout.APIUsageRecorder, forceManual bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// Manual mode: parse and validate the CSV BEFORE claiming the global sync
+		// manager, so a bad upload cannot leave a half-configured run behind.
+		isManual := forceManual || isManualRequested(c)
+		var upload *ManualASINUpload
+		if isManual {
+			log.Printf("[HOURLY_SYNC][MANUAL] ===== MANUAL HOURLY SYNC REQUEST RECEIVED =====")
+			log.Printf("[HOURLY_SYNC][MANUAL] %s %s from %s", c.Request.Method, c.Request.URL.Path, c.ClientIP())
+
+			parsed, err := readManualASINUpload(c)
+			if err != nil {
+				log.Printf("[HOURLY_SYNC][MANUAL] REJECTED: %v", err)
+				c.JSON(400, gin.H{"error": err.Error()})
+				return
+			}
+			upload = parsed
+
+			log.Printf("[HOURLY_SYNC][MANUAL] CSV %q parsed: %d valid ASINs, %d duplicates dropped, %d invalid, %d data rows read",
+				upload.Filename, upload.Valid, upload.Duplicates, upload.InvalidCount, upload.DataRows)
+			if upload.InvalidCount > 0 {
+				log.Printf("[HOURLY_SYNC][MANUAL] Rejected values (up to %d shown): %v", maxInvalidASINSamples, upload.Invalid)
+			}
+		}
+
 		hourlySyncManagerMutex.Lock()
 		if globalHourlySyncManager != nil &&
 			globalHourlySyncManager.status != nil &&
 			globalHourlySyncManager.status.IsRunning {
 			hourlySyncManagerMutex.Unlock()
+			if isManual {
+				log.Printf("[HOURLY_SYNC][MANUAL] REJECTED: an hourly sync is already in progress")
+			}
 			c.JSON(400, gin.H{
 				"error":  "Hourly sync is already in progress",
 				"status": globalHourlySyncManager.GetStatus(),
@@ -1386,26 +2165,57 @@ func JSHourlySync(stagingClient, productionClient *database.PostgreSQLClient, re
 			return
 		}
 
-		// Parse query parameters
-		marketplace := c.DefaultQuery("marketplace", "us")
-		debugMode := c.DefaultQuery("debug", "false") == "true"
+		// Parse parameters (query string, falling back to the multipart form so a
+		// manual run can send everything in one body)
+		marketplace := paramOrDefault(c, "marketplace", "us")
+		debugMode := paramOrDefault(c, "debug", "false") == "true"
 
 		globalHourlySyncManager = NewHourlySyncManager(stagingClient, productionClient, debugMode, recorder)
+		if isManual {
+			globalHourlySyncManager.isManual = true
+			globalHourlySyncManager.manualASINs = upload.ASINs
+			globalHourlySyncManager.manualSource = upload.Filename
+		}
 		hourlySyncManagerMutex.Unlock()
 
 		if debugMode {
 			log.Println("[HOURLY_SYNC] ========== DEBUG MODE ENABLED ==========")
-			log.Printf("[HOURLY_SYNC] Starting hourly sync with marketplace=%s", marketplace)
+			log.Printf("[HOURLY_SYNC] Starting hourly sync with marketplace=%s, manual=%v", marketplace, isManual)
 		}
 
 		// Run sync synchronously (cloud jobs expect completion)
+		startedAt := time.Now()
 		globalHourlySyncManager.RunHourlySync(marketplace)
 
-		c.JSON(200, gin.H{
+		if isManual {
+			status := globalHourlySyncManager.GetStatus()
+			log.Printf("[HOURLY_SYNC][MANUAL] ===== MANUAL HOURLY SYNC FINISHED in %s =====", time.Since(startedAt).Round(time.Second))
+			log.Printf("[HOURLY_SYNC][MANUAL] CSV=%q uploaded=%d processed=%d product_ok=%d sales_ok=%d failed=%d api_calls=%d stopped_early=%v",
+				upload.Filename, len(upload.ASINs), status.TotalASINsProcessed, status.SuccessfulProductSync,
+				status.SuccessfulSalesSync, status.FailedASINs, status.TotalAPICalls, status.StoppedEarly)
+			if status.StoppedEarly {
+				log.Printf("[HOURLY_SYNC][MANUAL] STOP REASON: %s", status.StopReason)
+			}
+			if status.ErrorSummary != nil {
+				log.Printf("[HOURLY_SYNC][MANUAL] Errors - db=%d api=%d parse=%d other=%d samples=%v",
+					status.ErrorSummary.DBErrors, status.ErrorSummary.APIErrors,
+					status.ErrorSummary.ParseErrors, status.ErrorSummary.OtherErrors,
+					status.ErrorSummary.SampleErrors)
+			}
+		}
+
+		response := gin.H{
 			"message":    "Hourly sync completed",
 			"status":     globalHourlySyncManager.GetStatus(),
 			"debug_mode": debugMode,
-		})
+			"is_manual":  isManual,
+		}
+		if isManual {
+			response["message"] = fmt.Sprintf("Manual hourly sync completed for %d ASINs from the uploaded CSV", len(upload.ASINs))
+			response["upload"] = upload
+		}
+
+		c.JSON(200, response)
 	}
 }
 
@@ -1430,14 +2240,16 @@ func GetJSHourlySyncStatus(stagingClient, productionClient *database.PostgreSQLC
 
 // RunHourlySync executes the hourly sync process
 func (m *HourlySyncManager) RunHourlySync(marketplace string) {
-	m.debugLog("========== HOURLY SYNC STARTED ==========")
-	m.debugLog("Marketplace: %s", marketplace)
+	m.monitorLog("========== HOURLY SYNC STARTED ==========")
+	m.monitorLog("Marketplace: %s | manual: %v | source: %s", marketplace, m.isManual, m.asinSourceLabel())
 	m.debugLog("Debug mode: %v", m.debugMode)
 
 	m.statusMutex.Lock()
 	m.status = &HourlySyncStatus{
 		StartedAt:    time.Now(),
 		IsRunning:    true,
+		IsManual:     m.isManual,
+		ManualSource: m.manualSource,
 		ErrorSummary: &ErrorSummary{SampleErrors: []string{}},
 	}
 	m.statusMutex.Unlock()
@@ -1453,56 +2265,121 @@ func (m *HourlySyncManager) RunHourlySync(marketplace string) {
 		duration := now.Sub(m.status.StartedAt)
 		m.statusMutex.Unlock()
 
-		m.debugLog("========== HOURLY SYNC COMPLETED ==========")
-		m.debugLog("Duration: %v", duration)
-		m.debugLog("Total ASINs processed: %d", m.status.TotalASINsProcessed)
-		m.debugLog("Successful product syncs: %d", m.status.SuccessfulProductSync)
-		m.debugLog("Successful sales syncs: %d", m.status.SuccessfulSalesSync)
-		m.debugLog("Failed ASINs: %d", m.status.FailedASINs)
-		m.debugLog("Total API calls: %d", m.apiCallCount)
+		m.monitorLog("========== HOURLY SYNC COMPLETED ==========")
+		m.monitorLog("Duration: %v", duration)
+		m.monitorLog("Total ASINs processed: %d", m.status.TotalASINsProcessed)
+		m.monitorLog("Successful product syncs: %d", m.status.SuccessfulProductSync)
+		m.monitorLog("Successful sales syncs: %d", m.status.SuccessfulSalesSync)
+		m.monitorLog("Failed ASINs: %d", m.status.FailedASINs)
+		m.monitorLog("Total API calls: %d", m.apiCallCount)
 		m.debugLog("Sending Discord notification...")
 
 		m.sendHourlySyncDiscordNotification()
 		m.debugLog("Discord notification sent")
 	}()
 
-	// ==================== STEP 1: CLEANUP ====================
-	m.debugLog("---------- STEP 1: CLEANUP ----------")
-	m.debugLog("Removing ASINs with product_visibility=false from sync_status...")
-	cleanedUp, err := m.cleanupSyncStatus()
-	if err != nil {
-		m.addHourlyError("db", fmt.Sprintf("Cleanup failed: %v", err))
-		log.Printf("[HOURLY_SYNC] CRITICAL: Cleanup failed: %v", err)
-	}
-	m.statusMutex.Lock()
-	m.status.CleanedUpASINs = cleanedUp
-	m.statusMutex.Unlock()
-	m.debugLog("Cleanup complete: %d ASINs removed", cleanedUp)
-
-	// ==================== STEP 2: ADD NEW ASINs ====================
-	m.debugLog("---------- STEP 2: ADD NEW ASINs ----------")
-	m.debugLog("Adding new visible ASINs to sync_status...")
-	newASINs, err := m.addNewASINsToSyncStatus()
-	if err != nil {
-		m.addHourlyError("db", fmt.Sprintf("Failed to add new ASINs: %v", err))
-		log.Printf("[HOURLY_SYNC] CRITICAL: Failed to add new ASINs: %v", err)
-	}
-	m.statusMutex.Lock()
-	m.status.NewASINsAdded = newASINs
-	m.statusMutex.Unlock()
-	m.debugLog("New ASINs added to sync_status: %d", newASINs)
-
-	// ==================== STEP 3: SELECT ASINs ====================
-	m.debugLog("---------- STEP 3: SELECT ASINs ----------")
-	m.debugLog("Selecting up to %d ASINs (priority: new first, then stale >%d days)...",
-		HourlySyncASINLimit, StaleDataThresholdDays)
-	asinsToSync, err := m.selectASINsToSync()
-	if err != nil {
-		m.addHourlyError("db", fmt.Sprintf("Failed to select ASINs: %v", err))
-		log.Printf("[HOURLY_SYNC] CRITICAL: Failed to select ASINs: %v", err)
-		m.stopRequested = true
-		m.status.StopReason = "Failed to select ASINs"
+	// ==================== STEP 0: RESOLVE TABLES ====================
+	m.monitorLog("---------- STEP 0: RESOLVE TABLES ----------")
+	m.logTargetDatabases()
+	if err := m.resolveFanOutTables(); err != nil {
+		m.addHourlyError("db", fmt.Sprintf("Failed to resolve fan-out tables: %v", err))
+		log.Printf("%s CRITICAL: Failed to resolve fan-out tables: %v", m.logPrefix(), err)
+		m.statusMutex.Lock()
+		m.status.StoppedEarly = true
+		m.status.StopReason = "Failed to resolve fan-out tables"
+		m.statusMutex.Unlock()
 		return
+	}
+	m.monitorLog("Staging tables    : asin=%s mapping=%s product=%s sales=%s sync_status=%s",
+		m.stagingTables.asin, m.stagingTables.mapping, m.stagingTables.product, m.stagingTables.sales,
+		m.stagingClient.TableName("jungle_scout_sync_status"))
+	if m.productionClient != nil {
+		m.monitorLog("Production tables : asin=%s mapping=%s product=%s sales=%s",
+			m.prodTables.asin, m.prodTables.mapping, m.prodTables.product, m.prodTables.sales)
+	}
+
+	// ==================== STEPS 1-3: DECIDE WHAT TO SYNC ====================
+	// Manual mode replaces the whole cleanup/add-new/select pipeline: the CSV is
+	// the ASIN list. Cleanup in particular MUST be skipped — it deletes every
+	// sync_status row outside the database-derived parent set, which has nothing
+	// to do with what the caller uploaded.
+	var asinsToSync []ASINSyncInfo
+	if m.isManual {
+		m.monitorLog("---------- STEPS 1-3: MANUAL ASIN LIST ----------")
+		m.monitorLog("MANUAL MODE: %d ASINs from uploaded CSV %q", len(m.manualASINs), m.manualSource)
+		m.monitorLog("SKIPPED step 1 cleanup      : no sync_status rows are deleted")
+		m.monitorLog("SKIPPED step 2 add-new      : no ASINs are pulled from %s", m.stagingTables.asin)
+		m.monitorLog("SKIPPED step 3 selection    : the %d CSV ASINs are the entire workload (no %d-ASIN cap, no new/stale query)",
+			len(m.manualASINs), HourlySyncASINLimit)
+		m.logASINList("CSV ASINs to sync", m.manualASINs)
+
+		queued, err := m.ensureManualSyncStatusRows()
+		if err != nil {
+			m.addHourlyError("db", fmt.Sprintf("Failed to queue manual ASINs: %v", err))
+			log.Printf("%s CRITICAL: Failed to queue manual ASINs: %v", m.logPrefix(), err)
+			m.stopRequested = true
+			m.statusMutex.Lock()
+			m.status.StopReason = "Failed to queue manual ASINs"
+			m.statusMutex.Unlock()
+			return
+		}
+		m.statusMutex.Lock()
+		m.status.NewASINsAdded = queued
+		m.statusMutex.Unlock()
+		m.monitorLog("Queued in %s: %d new rows inserted, %d already present",
+			m.stagingClient.TableName("jungle_scout_sync_status"), queued, len(m.manualASINs)-queued)
+
+		asinsToSync, err = m.manualASINSyncInfo()
+		if err != nil {
+			m.addHourlyError("db", fmt.Sprintf("Failed to load manual ASIN state: %v", err))
+			log.Printf("%s CRITICAL: Failed to load manual ASIN state: %v", m.logPrefix(), err)
+			m.stopRequested = true
+			m.statusMutex.Lock()
+			m.status.StopReason = "Failed to load manual ASIN state"
+			m.statusMutex.Unlock()
+			return
+		}
+	} else {
+		// ==================== STEP 1: CLEANUP ====================
+		m.debugLog("---------- STEP 1: CLEANUP ----------")
+		m.debugLog("Removing ASINs that are no longer parents-to-sync from sync_status...")
+		cleanedUp, err := m.cleanupSyncStatus()
+		if err != nil {
+			m.addHourlyError("db", fmt.Sprintf("Cleanup failed: %v", err))
+			log.Printf("[HOURLY_SYNC] CRITICAL: Cleanup failed: %v", err)
+		}
+		m.statusMutex.Lock()
+		m.status.CleanedUpASINs = cleanedUp
+		m.statusMutex.Unlock()
+		m.debugLog("Cleanup complete: %d ASINs removed", cleanedUp)
+
+		// ==================== STEP 2: ADD NEW ASINs ====================
+		m.debugLog("---------- STEP 2: ADD NEW ASINs ----------")
+		m.debugLog("Adding new ASINs to sync_status...")
+		newASINs, err := m.addNewASINsToSyncStatus()
+		if err != nil {
+			m.addHourlyError("db", fmt.Sprintf("Failed to add new ASINs: %v", err))
+			log.Printf("[HOURLY_SYNC] CRITICAL: Failed to add new ASINs: %v", err)
+		}
+		m.statusMutex.Lock()
+		m.status.NewASINsAdded = newASINs
+		m.statusMutex.Unlock()
+		m.debugLog("New ASINs added to sync_status: %d", newASINs)
+
+		// ==================== STEP 3: SELECT ASINs ====================
+		m.debugLog("---------- STEP 3: SELECT ASINs ----------")
+		m.debugLog("Selecting up to %d ASINs (priority: new first, then stale >%d days)...",
+			HourlySyncASINLimit, StaleDataThresholdDays)
+		asinsToSync, err = m.selectASINsToSync()
+		if err != nil {
+			m.addHourlyError("db", fmt.Sprintf("Failed to select ASINs: %v", err))
+			log.Printf("[HOURLY_SYNC] CRITICAL: Failed to select ASINs: %v", err)
+			m.stopRequested = true
+			m.statusMutex.Lock()
+			m.status.StopReason = "Failed to select ASINs"
+			m.statusMutex.Unlock()
+			return
+		}
 	}
 
 	if len(asinsToSync) == 0 {
@@ -1511,14 +2388,20 @@ func (m *HourlySyncManager) RunHourlySync(marketplace string) {
 		return
 	}
 
-	// Count new vs stale
-	newCount, staleCount := 0, 0
+	// Count new vs stale vs sales-gap
+	newCount, staleCount, gapCount, deferredCount := 0, 0, 0, 0
 	var newASINsList, staleASINsList []string
 	for _, info := range asinsToSync {
-		if info.IsNew {
+		if info.DeferSales {
+			deferredCount++
+		}
+		switch {
+		case info.IsNew:
 			newCount++
 			newASINsList = append(newASINsList, info.ASIN)
-		} else {
+		case info.SalesGapOnly:
+			gapCount++
+		default:
 			staleCount++
 			staleASINsList = append(staleASINsList, info.ASIN)
 		}
@@ -1526,11 +2409,14 @@ func (m *HourlySyncManager) RunHourlySync(marketplace string) {
 	m.statusMutex.Lock()
 	m.status.NewASINsSynced = newCount
 	m.status.StaleASINsSynced = staleCount
+	m.status.SalesGapASINs = gapCount
 	m.statusMutex.Unlock()
 
-	m.debugLog("Selected %d ASINs total:", len(asinsToSync))
-	m.debugLog("  - New ASINs: %d", newCount)
-	m.debugLog("  - Stale ASINs: %d", staleCount)
+	m.monitorLog("To sync: %d ASINs total (%d never synced -> 1 year of sales, %d stale -> incremental sales, %d sales-gap re-drive)",
+		len(asinsToSync), newCount, staleCount, gapCount)
+	if deferredCount > 0 {
+		m.monitorLog("Of those, %d full-year backfills are DEFERRED to a later run — their product data is still written", deferredCount)
+	}
 	if len(newASINsList) > 0 {
 		m.debugLog("  - New ASIN list: %v", newASINsList)
 	}
@@ -1539,34 +2425,219 @@ func (m *HourlySyncManager) RunHourlySync(marketplace string) {
 	}
 
 	// ==================== STEP 4 & 5: SYNC DATA ====================
-	m.debugLog("---------- STEP 4 & 5: SYNC PRODUCT & SALES DATA ----------")
-	m.syncSelectedASINs(asinsToSync, marketplace)
+	m.monitorLog("---------- STEP 4 & 5: SYNC PRODUCT & SALES DATA ----------")
+
+	// The product API takes ProductBatchSize ASINs per call. An automatic run is
+	// capped at HourlySyncASINLimit and so is always a single batch; a manual CSV
+	// can be any size, so walk it in batches. syncSelectedASINs accumulates into
+	// the status counters, which makes repeated calls safe.
+	totalBatches := (len(asinsToSync) + ProductBatchSize - 1) / ProductBatchSize
+	m.monitorLog("Workload: %d ASINs in %d batch(es) of up to %d", len(asinsToSync), totalBatches, ProductBatchSize)
+
+	// Heartbeat: a full-set run is quiet for a long time, and a slow run has to be
+	// distinguishable from a hung one in the logs.
+	runStartedAt := time.Now()
+	processed := 0
+
+	for i := 0; i < len(asinsToSync); i += ProductBatchSize {
+		batchNo := (i / ProductBatchSize) + 1
+		if m.stopRequested {
+			m.monitorLog("STOPPING before batch %d/%d due to critical errors - %d ASINs left unprocessed",
+				batchNo, totalBatches, len(asinsToSync)-i)
+			break
+		}
+
+		end := i + ProductBatchSize
+		if end > len(asinsToSync) {
+			end = len(asinsToSync)
+		}
+		m.monitorLog("===== BATCH %d/%d (%d ASINs) =====", batchNo, totalBatches, end-i)
+		m.syncSelectedASINs(asinsToSync[i:end], marketplace)
+
+		processed = end
+		if batchNo%progressEveryBatches == 0 || end == len(asinsToSync) {
+			m.logProgress(processed, len(asinsToSync), runStartedAt)
+		}
+	}
+
+	// ==================== STEP 6: RETRY PASS ====================
+	// ASINs that failed on something plausibly temporary get another attempt before
+	// the run gives up on them. Without this, a rate-limit burst or a brief network
+	// blip strands those ASINs until the next scheduled run — which on a ten-day
+	// cycle is ten days of missing data rather than the hour it used to be.
+	m.runRetryPasses(marketplace)
 }
 
-// cleanupSyncStatus removes sync_status records for ASINs with product_visibility=false
+// progressEveryBatches controls how often the heartbeat line is written during the
+// main loop. At 100 ASINs per batch this is roughly every 2,000 ASINs.
+const progressEveryBatches = 20
+
+// logProgress writes a heartbeat with throughput and a projected finish time.
+func (m *HourlySyncManager) logProgress(done, total int, startedAt time.Time) {
+	elapsed := time.Since(startedAt)
+	if done <= 0 || total <= 0 {
+		return
+	}
+
+	rate := float64(done) / elapsed.Seconds()
+	remaining := "unknown"
+	if rate > 0 {
+		remaining = time.Duration(float64(total-done) / rate * float64(time.Second)).Round(time.Minute).String()
+	}
+
+	m.monitorLog("[Progress] %d/%d ASINs (%.1f%%) in %s — %.1f ASIN/s, ~%s remaining, %d API calls so far",
+		done, total, float64(done)/float64(total)*100, elapsed.Round(time.Second), rate, remaining, m.apiCallCount)
+}
+
+// runRetryPasses re-attempts ASINs whose sales fetch failed on a transient error.
+// Each pass rebuilds the batch from the queue, so an ASIN that fails again simply
+// falls out: queueForRetry ignores calls made while inRetryPass is set.
+//
+// Anything still failing after the passes is recorded as a genuine failure in
+// sync_status, which is what makes it visible to the next run's sales-gap tier.
+func (m *HourlySyncManager) runRetryPasses(marketplace string) {
+	if SalesRetryPasses <= 0 {
+		return
+	}
+
+	for pass := 1; pass <= SalesRetryPasses; pass++ {
+		if m.stopRequested {
+			m.monitorLog("[Retry] Skipping pass %d: run already abandoned", pass)
+			return
+		}
+
+		queued := m.takeRetryQueue()
+		if len(queued) == 0 {
+			if pass == 1 {
+				m.monitorLog("---------- STEP 6: RETRY PASS ----------")
+				m.monitorLog("[Retry] Nothing queued — no transient failures this run")
+			}
+			return
+		}
+
+		m.monitorLog("---------- STEP 6: RETRY PASS %d/%d ----------", pass, SalesRetryPasses)
+		m.monitorLog("[Retry] Re-attempting %d ASINs that failed on transient errors", len(queued))
+
+		m.statusMutex.Lock()
+		m.status.RetriedASINs += len(queued)
+		before := m.status.SuccessfulSalesSync
+		m.statusMutex.Unlock()
+
+		// Suppress re-queueing so a persistently failing ASIN cannot loop, and so
+		// this pass ends with a settled outcome for every ASIN in it.
+		m.retryMutex.Lock()
+		m.inRetryPass = true
+		m.retryMutex.Unlock()
+
+		for i := 0; i < len(queued); i += ProductBatchSize {
+			if m.stopRequested {
+				m.monitorLog("[Retry] Stopping mid-pass: run abandoned")
+				break
+			}
+			end := i + ProductBatchSize
+			if end > len(queued) {
+				end = len(queued)
+			}
+			m.syncSelectedASINs(queued[i:end], marketplace)
+		}
+
+		m.retryMutex.Lock()
+		m.inRetryPass = false
+		m.retryMutex.Unlock()
+
+		m.statusMutex.Lock()
+		recovered := m.status.SuccessfulSalesSync - before
+		m.status.RecoveredASINs += recovered
+		m.statusMutex.Unlock()
+
+		m.monitorLog("[Retry] Pass %d recovered %d of %d ASINs", pass, recovered, len(queued))
+	}
+}
+
+// ensureManualSyncStatusRows queues the uploaded ASINs in sync_status without
+// touching rows that already exist. A CSV may name ASINs that were never part of
+// the database-derived parent set, and the product/sales writes update
+// sync_status by ASIN — without a row those updates would silently no-op.
+// NOTE: sync_status is staging-only, production writes are skipped.
+func (m *HourlySyncManager) ensureManualSyncStatusRows() (int, error) {
+	stagingSyncTable := m.stagingClient.TableName("jungle_scout_sync_status")
+
+	insertQuery := fmt.Sprintf(`
+		INSERT INTO %s (asin, has_product_data, has_sales_data, updated_at)
+		SELECT u.asin, false, false, CURRENT_TIMESTAMP
+		FROM unnest($1::text[]) AS u(asin)
+		ON CONFLICT (asin) DO NOTHING
+	`, stagingSyncTable)
+
+	result, err := m.stagingClient.DB.Exec(insertQuery, pq.Array(m.manualASINs))
+	if err != nil {
+		return 0, fmt.Errorf("staging insert failed: %w", err)
+	}
+
+	rowsInserted, _ := result.RowsAffected()
+	return int(rowsInserted), nil
+}
+
+// manualASINSyncInfo turns the uploaded ASIN list into the sync list, annotated
+// with what sync_status already knows about each ASIN so the sales fetch still
+// picks the right date range (1 year for never-synced ASINs, incremental from
+// the last sync otherwise). CSV order is preserved.
+func (m *HourlySyncManager) manualASINSyncInfo() ([]ASINSyncInfo, error) {
+	syncTable := m.stagingClient.TableName("jungle_scout_sync_status")
+
+	query := fmt.Sprintf(`
+		SELECT asin, has_product_data, sales_estimate_data_synced_at
+		FROM %s
+		WHERE asin = ANY($1::text[])
+	`, syncTable)
+
+	rows, err := m.stagingClient.DB.Query(query, pq.Array(m.manualASINs))
+	if err != nil {
+		return nil, fmt.Errorf("failed to query manual ASIN state: %w", err)
+	}
+	defer rows.Close()
+
+	known := make(map[string]ASINSyncInfo, len(m.manualASINs))
+	for rows.Next() {
+		var asin string
+		var hasProductData sql.NullBool
+		var salesSyncedAt sql.NullTime
+		if err := rows.Scan(&asin, &hasProductData, &salesSyncedAt); err != nil {
+			return nil, fmt.Errorf("failed to scan manual ASIN state: %w", err)
+		}
+		info := ASINSyncInfo{ASIN: asin, IsNew: !hasProductData.Valid || !hasProductData.Bool}
+		if salesSyncedAt.Valid {
+			info.SalesEstimateSyncedAt = &salesSyncedAt.Time
+		}
+		known[asin] = info
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating manual ASIN state: %w", err)
+	}
+
+	results := make([]ASINSyncInfo, 0, len(m.manualASINs))
+	for _, asin := range m.manualASINs {
+		if info, ok := known[asin]; ok {
+			results = append(results, info)
+			continue
+		}
+		// No sync_status row (the insert above should have created one, so this
+		// only happens on a race): treat it as brand new.
+		results = append(results, ASINSyncInfo{ASIN: asin, IsNew: true})
+	}
+	return results, nil
+}
+
+// cleanupSyncStatus removes sync_status records for ASINs that are no longer in
+// the parent set (deleted from the catalogue, or now mapped as someone's child).
+// asin_visibility is not considered — inactive ASINs stay queued.
 // NOTE: sync_status is staging-only, production writes are skipped
 func (m *HourlySyncManager) cleanupSyncStatus() (int, error) {
-	m.debugLog("[Cleanup] Getting product table name...")
-	productTableName, err := utils.GetTableName(m.stagingClient, "product")
-	if err != nil {
-		m.debugLog("[Cleanup] ERROR: Failed to get product table name: %v", err)
-		return 0, fmt.Errorf("failed to get product table name: %w", err)
-	}
-	m.debugLog("[Cleanup] Product table: %s", productTableName)
-
 	stagingSyncTable := m.stagingClient.TableName("jungle_scout_sync_status")
 	m.debugLog("[Cleanup] Staging sync table: %s", stagingSyncTable)
+	m.debugLog("[Cleanup] ASIN table: %s, mapping table: %s", m.stagingTables.asin, m.stagingTables.mapping)
 
-	deleteQuery := fmt.Sprintf(`
-		DELETE FROM %s
-		WHERE asin NOT IN (
-			SELECT DISTINCT asin
-			FROM %s
-			WHERE product_visibility = true
-			AND asin IS NOT NULL
-			AND asin != ''
-		)
-	`, stagingSyncTable, productTableName)
+	deleteQuery := syncStatusCleanupQuery(stagingSyncTable, m.stagingTables)
 
 	m.debugLog("[Cleanup] Executing DELETE on staging...")
 	result, err := m.stagingClient.DB.Exec(deleteQuery)
@@ -1585,26 +2656,11 @@ func (m *HourlySyncManager) cleanupSyncStatus() (int, error) {
 // addNewASINsToSyncStatus inserts ASINs that exist in product table but not in sync_status
 // NOTE: sync_status is staging-only, production writes are skipped
 func (m *HourlySyncManager) addNewASINsToSyncStatus() (int, error) {
-	m.debugLog("[AddNew] Getting product table name...")
-	productTableName, err := utils.GetTableName(m.stagingClient, "product")
-	if err != nil {
-		m.debugLog("[AddNew] ERROR: Failed to get product table name: %v", err)
-		return 0, fmt.Errorf("failed to get product table name: %w", err)
-	}
-
 	stagingSyncTable := m.stagingClient.TableName("jungle_scout_sync_status")
 
-	insertQuery := fmt.Sprintf(`
-		INSERT INTO %s (asin, has_product_data, has_sales_data, updated_at)
-		SELECT DISTINCT p.asin, false, false, CURRENT_TIMESTAMP
-		FROM %s p
-		WHERE p.product_visibility = true
-		AND p.asin IS NOT NULL
-		AND p.asin != ''
-		AND p.asin NOT IN (SELECT asin FROM %s)
-	`, stagingSyncTable, productTableName, stagingSyncTable)
+	insertQuery := syncStatusAddNewQuery(stagingSyncTable, m.stagingTables)
 
-	m.debugLog("[AddNew] Inserting new ASINs into staging sync_status...")
+	m.debugLog("[AddNew] Inserting new parent ASINs into staging sync_status...")
 	result, err := m.stagingClient.DB.Exec(insertQuery)
 	if err != nil {
 		m.debugLog("[AddNew] ERROR: Staging insert failed: %v", err)
@@ -1618,60 +2674,116 @@ func (m *HourlySyncManager) addNewASINsToSyncStatus() (int, error) {
 	return int(rowsInserted), nil
 }
 
-// selectASINsToSync selects up to 100 ASINs prioritizing new ASINs, then stale ASINs
+// scanASINSyncInfo drains a (asin, sales_estimate_data_synced_at) result set into
+// ASINSyncInfo values. Shared by the three selection tiers below.
+func scanASINSyncInfo(rows *sql.Rows) ([]ASINSyncInfo, error) {
+	defer rows.Close()
+
+	var out []ASINSyncInfo
+	for rows.Next() {
+		var info ASINSyncInfo
+		var salesSyncedAt sql.NullTime
+		if err := rows.Scan(&info.ASIN, &salesSyncedAt); err != nil {
+			return nil, fmt.Errorf("failed to scan ASIN row: %w", err)
+		}
+		if salesSyncedAt.Valid {
+			info.SalesEstimateSyncedAt = &salesSyncedAt.Time
+		}
+		out = append(out, info)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating ASIN rows: %w", err)
+	}
+	return out, nil
+}
+
+// selectASINsToSync picks the ASINs one run will process, in three tiers:
+//
+//  1. NEW — never fetched, or previously not found in JungleScout and past the
+//     retry window.
+//  2. STALE — product data older than StaleDataThresholdDays.
+//  3. SALES GAP — product data still current, but the sales fetch previously
+//     failed or never completed.
+//
+// Tier 3 exists because selection used to key off product_data_synced_at alone.
+// An ASIN whose product write succeeded and whose sales write failed looked
+// perfectly fresh, so nothing re-drove it until its product data went stale —
+// one full cycle later. It also catches rows with has_product_data=true but a
+// NULL product_data_synced_at, which tier 2 cannot see at all.
+//
+// The three tiers are disjoint by construction (tier 1 requires
+// has_product_data=false; tier 2 requires a non-NULL timestamp below the
+// threshold; tier 3 requires the timestamp to be NULL or at/above it), but the
+// results are still de-duplicated by ASIN so a future edit to any predicate
+// cannot produce the same ASIN twice in one batch.
 func (m *HourlySyncManager) selectASINsToSync() ([]ASINSyncInfo, error) {
 	syncTable := m.stagingClient.TableName("jungle_scout_sync_status")
 	retryThreshold := time.Now().AddDate(0, 0, -ProductNotFoundRetryDays)
+	staleThreshold := time.Now().AddDate(0, 0, -StaleDataThresholdDays)
 
 	m.debugLog("[Select] Sync table: %s", syncTable)
-	m.debugLog("[Select] Retry threshold (15 days): %s", retryThreshold.Format("2006-01-02 15:04:05"))
+	m.debugLog("[Select] Not-found retry threshold (%d days): %s",
+		ProductNotFoundRetryDays, retryThreshold.Format("2006-01-02 15:04:05"))
+	m.debugLog("[Select] Stale threshold (%d days): %s",
+		StaleDataThresholdDays, staleThreshold.Format("2006-01-02 15:04:05"))
 
-	// Priority 1: New ASINs (never synced OR product not found but retry period passed)
-	// Skip ASINs where product_fetch_attempted_at is within last 15 days (not found in JS API)
-	m.debugLog("[Select] Querying NEW ASINs (has_product_data=false, retry period passed)...")
-	newASINsQuery := fmt.Sprintf(`
+	var results []ASINSyncInfo
+	seen := make(map[string]bool)
+
+	// add appends rows that have not already been selected by an earlier tier.
+	add := func(batch []ASINSyncInfo, isNew, salesGapOnly bool) int {
+		added := 0
+		for _, info := range batch {
+			if seen[info.ASIN] {
+				continue
+			}
+			seen[info.ASIN] = true
+			info.IsNew = isNew
+			info.SalesGapOnly = salesGapOnly
+			results = append(results, info)
+			added++
+		}
+		return added
+	}
+
+	// The effective ceiling is the tighter of the runaway guard and the deliberate
+	// throttle. Which one bit matters for how the result is reported: hitting the
+	// throttle is expected, hitting the guard is an incident.
+	limit := HourlySyncASINLimit
+	throttled := false
+	if SyncMaxPerRun > 0 && SyncMaxPerRun < limit {
+		limit = SyncMaxPerRun
+		throttled = true
+		m.monitorLog("[Select] SYNC_MAX_PER_RUN=%d is throttling this run (guard is %d) — a partial run is expected, not an error",
+			SyncMaxPerRun, HourlySyncASINLimit)
+	}
+
+	// ---- Tier 1: never fetched (or past the not-found retry window) ----
+	m.debugLog("[Select] Querying NEW ASINs (has_product_data=false, retry window passed)...")
+	newRows, err := m.stagingClient.DB.Query(fmt.Sprintf(`
 		SELECT asin, sales_estimate_data_synced_at
 		FROM %s
 		WHERE has_product_data = false
 		AND (product_fetch_attempted_at IS NULL OR product_fetch_attempted_at < $1)
 		ORDER BY created_at ASC, asin ASC
 		LIMIT %d
-	`, syncTable, HourlySyncASINLimit)
-
-	rows, err := m.stagingClient.DB.Query(newASINsQuery, retryThreshold)
+	`, syncTable, limit), retryThreshold)
 	if err != nil {
 		m.debugLog("[Select] ERROR: Failed to query new ASINs: %v", err)
 		return nil, fmt.Errorf("failed to query new ASINs: %w", err)
 	}
-
-	var results []ASINSyncInfo
-	for rows.Next() {
-		var info ASINSyncInfo
-		var salesSyncedAt sql.NullTime
-		if err := rows.Scan(&info.ASIN, &salesSyncedAt); err != nil {
-			rows.Close()
-			m.debugLog("[Select] ERROR: Failed to scan new ASIN: %v", err)
-			return nil, fmt.Errorf("failed to scan new ASIN: %w", err)
-		}
-		info.IsNew = true
-		if salesSyncedAt.Valid {
-			info.SalesEstimateSyncedAt = &salesSyncedAt.Time
-		}
-		results = append(results, info)
+	newBatch, err := scanASINSyncInfo(newRows)
+	if err != nil {
+		m.debugLog("[Select] ERROR: %v", err)
+		return nil, fmt.Errorf("new ASINs: %w", err)
 	}
-	rows.Close()
-	m.debugLog("[Select] Found %d NEW ASINs", len(results))
+	newCount := add(newBatch, true, false)
+	m.debugLog("[Select] Found %d NEW ASINs", newCount)
 
-	// Priority 2: Stale ASINs (>30 days old)
-	remaining := HourlySyncASINLimit - len(results)
-	m.debugLog("[Select] Remaining slots for stale ASINs: %d", remaining)
-
-	if remaining > 0 {
-		staleThreshold := time.Now().AddDate(0, 0, -StaleDataThresholdDays)
-		m.debugLog("[Select] Stale threshold (30 days): %s", staleThreshold.Format("2006-01-02 15:04:05"))
-		m.debugLog("[Select] Querying STALE ASINs (product_data_synced_at < threshold)...")
-
-		staleASINsQuery := fmt.Sprintf(`
+	// ---- Tier 2: product data older than the staleness threshold ----
+	if remaining := limit - len(results); remaining > 0 {
+		m.debugLog("[Select] Querying STALE ASINs (%d slots remaining)...", remaining)
+		staleRows, err := m.stagingClient.DB.Query(fmt.Sprintf(`
 			SELECT asin, sales_estimate_data_synced_at
 			FROM %s
 			WHERE has_product_data = true
@@ -1679,39 +2791,101 @@ func (m *HourlySyncManager) selectASINsToSync() ([]ASINSyncInfo, error) {
 			AND product_data_synced_at < $1
 			ORDER BY product_data_synced_at ASC
 			LIMIT %d
-		`, syncTable, remaining)
-
-		staleRows, err := m.stagingClient.DB.Query(staleASINsQuery, staleThreshold)
+		`, syncTable, remaining), staleThreshold)
 		if err != nil {
 			m.debugLog("[Select] ERROR: Failed to query stale ASINs: %v", err)
 			return nil, fmt.Errorf("failed to query stale ASINs: %w", err)
 		}
-
-		staleCount := 0
-		for staleRows.Next() {
-			var info ASINSyncInfo
-			var salesSyncedAt sql.NullTime
-			if err := staleRows.Scan(&info.ASIN, &salesSyncedAt); err != nil {
-				staleRows.Close()
-				m.debugLog("[Select] ERROR: Failed to scan stale ASIN: %v", err)
-				return nil, fmt.Errorf("failed to scan stale ASIN: %w", err)
-			}
-			info.IsNew = false
-			if salesSyncedAt.Valid {
-				info.SalesEstimateSyncedAt = &salesSyncedAt.Time
-			}
-			results = append(results, info)
-			staleCount++
+		staleBatch, err := scanASINSyncInfo(staleRows)
+		if err != nil {
+			m.debugLog("[Select] ERROR: %v", err)
+			return nil, fmt.Errorf("stale ASINs: %w", err)
 		}
-		staleRows.Close()
-		m.debugLog("[Select] Found %d STALE ASINs", staleCount)
+		m.debugLog("[Select] Found %d STALE ASINs", add(staleBatch, false, false))
 	}
 
-	m.debugLog("[Select] Total ASINs selected: %d", len(results))
+	// ---- Tier 3: product fresh, sales missing ----
+	if remaining := limit - len(results); remaining > 0 {
+		m.debugLog("[Select] Querying SALES GAP ASINs (%d slots remaining)...", remaining)
+		gapRows, err := m.stagingClient.DB.Query(fmt.Sprintf(`
+			SELECT asin, sales_estimate_data_synced_at
+			FROM %s
+			WHERE has_product_data = true
+			AND has_sales_data = false
+			AND (product_data_synced_at IS NULL OR product_data_synced_at >= $1)
+			ORDER BY updated_at ASC, asin ASC
+			LIMIT %d
+		`, syncTable, remaining), staleThreshold)
+		if err != nil {
+			m.debugLog("[Select] ERROR: Failed to query sales-gap ASINs: %v", err)
+			return nil, fmt.Errorf("failed to query sales-gap ASINs: %w", err)
+		}
+		gapBatch, err := scanASINSyncInfo(gapRows)
+		if err != nil {
+			m.debugLog("[Select] ERROR: %v", err)
+			return nil, fmt.Errorf("sales-gap ASINs: %w", err)
+		}
+		gapCount := add(gapBatch, false, true)
+		m.debugLog("[Select] Found %d SALES GAP ASINs", gapCount)
+		if gapCount > 0 {
+			m.monitorLog("[Select] %d ASINs re-driven for a missing sales fetch (product data was already current)", gapCount)
+		}
+	}
+
+	// A run that reaches the cap has been truncated. The cap sits far above the
+	// parent set, so this is a signal that something upstream is wrong — an
+	// unfiltered mapping table, a visibility flag applied to the wrong scope —
+	// not a normal full sync. Say so loudly: a truncated run otherwise looks
+	// exactly like a clean one in the logs and in the Discord summary.
+	// Only the runaway guard raises the alarm. A throttled run is also partial, but
+	// deliberately so — flagging it would make the alarm meaningless.
+	if len(results) >= limit {
+		if throttled {
+			m.monitorLog("[Select] Stopped at SYNC_MAX_PER_RUN=%d as configured — remaining ASINs stay queued for the next run",
+				SyncMaxPerRun)
+			m.statusMutex.Lock()
+			m.status.ThrottledPerRun = true
+			m.statusMutex.Unlock()
+		} else {
+			msg := fmt.Sprintf("selection reached SYNC_ASIN_LIMIT (%d) — the run is TRUNCATED and some ASINs were not queued; treat this as an incident, not a full sync", HourlySyncASINLimit)
+			log.Printf("%s CRITICAL: %s", m.logPrefix(), msg)
+			m.addHourlyError("other", msg)
+			m.statusMutex.Lock()
+			m.status.LimitReached = true
+			m.statusMutex.Unlock()
+		}
+	}
+
+	// Cap the number of never-synced ASINs that will pull a full year of sales in
+	// this run. Deferred ASINs still get their product data; only the year-long
+	// sales fetch waits. See ASINSyncInfo.DeferSales for why this defers rather
+	// than shortens the window.
+	fullBackfills, deferred := 0, 0
+	for i := range results {
+		if results[i].SalesEstimateSyncedAt != nil {
+			continue // incremental fetch, cheap
+		}
+		fullBackfills++
+		if MaxFullBackfills > 0 && fullBackfills > MaxFullBackfills {
+			results[i].DeferSales = true
+			deferred++
+		}
+	}
+	if deferred > 0 {
+		m.monitorLog("[Select] %d full-year sales backfills deferred to a later run (MAX_FULL_BACKFILLS=%d, %d needed)",
+			deferred, MaxFullBackfills, fullBackfills)
+		m.statusMutex.Lock()
+		m.status.DeferredBackfills = deferred
+		m.statusMutex.Unlock()
+	}
+
+	m.monitorLog("[Select] Total ASINs selected: %d (cap %d)", len(results), HourlySyncASINLimit)
 	return results, nil
 }
 
-// syncSelectedASINs syncs product and sales data for the selected ASINs
+// syncSelectedASINs syncs product and sales data for one batch of at most
+// ProductBatchSize ASINs. Status counters are accumulated, not assigned, so a
+// manual run can call this once per batch.
 func (m *HourlySyncManager) syncSelectedASINs(asins []ASINSyncInfo, marketplace string) {
 	m.debugLog("[SyncASINs] Starting sync for %d ASINs", len(asins))
 
@@ -1722,24 +2896,38 @@ func (m *HourlySyncManager) syncSelectedASINs(asins []ASINSyncInfo, marketplace 
 		requestedASINs[info.ASIN] = true
 	}
 
-	// Step 4: Fetch and store product data
-	m.debugLog("[SyncASINs] ===== STEP 4: PRODUCT DATA FETCH =====")
-	m.debugLog("[SyncASINs] Calling JungleScout Product API for %d ASINs...", len(asinStrings))
+	// Step 4: Fetch and store product data.
+	// The list logged here is EXACTLY the payload sent to JungleScout — nothing
+	// else is fetched for this batch.
+	m.monitorLog("[SyncASINs] ===== STEP 4: PRODUCT DATA FETCH =====")
+	m.logASINList("[SyncASINs] Sending to JungleScout Product API", asinStrings)
+	fetchStartedAt := time.Now()
 	apiResponse, err := m.jsClient.FetchProductData(asinStrings, marketplace)
 	m.apiCallCount++
 	m.statusMutex.Lock()
 	m.status.TotalAPICalls = m.apiCallCount
 	m.statusMutex.Unlock()
-	m.debugLog("[SyncASINs] API call #%d completed", m.apiCallCount)
+	m.monitorLog("[SyncASINs] Product API call #%d finished in %s", m.apiCallCount, time.Since(fetchStartedAt).Round(time.Millisecond))
 
 	if err != nil {
+		transient := isTransientAPIError(err)
 		m.addHourlyError("api", fmt.Sprintf("Product fetch failed: %v", err))
-		log.Printf("[HOURLY_SYNC] CRITICAL: Product fetch failed: %v", err)
+		log.Printf("%s Product fetch failed for %d ASINs (transient=%v): %v",
+			m.logPrefix(), len(asinStrings), transient, err)
 		m.debugLog("[SyncASINs] ERROR: Product API call failed: %v", err)
-		m.statusMutex.Lock()
-		m.status.FailedASINs = len(asins)
-		m.status.TotalASINsProcessed = len(asins)
-		m.statusMutex.Unlock()
+
+		m.markASINAttempted(asinStrings...)
+		m.markASINFailed(asinStrings...)
+
+		// A single rate-limited product call takes out a whole batch of 100, which
+		// makes it the most expensive failure in the run. Queue the batch so the
+		// retry pass gets another attempt rather than losing all 100 for a cycle.
+		if transient {
+			for _, info := range asins {
+				m.queueForRetry(info)
+			}
+			m.monitorLog("[SyncASINs] %d ASINs queued for retry after a transient product-fetch failure", len(asins))
+		}
 		return
 	}
 
@@ -1747,14 +2935,15 @@ func (m *HourlySyncManager) syncSelectedASINs(asins []ASINSyncInfo, marketplace 
 	if apiResponse != nil {
 		returnedCount = len(apiResponse.Data)
 	}
-	m.debugLog("[SyncASINs] Product API returned %d products (requested %d)", returnedCount, len(asinStrings))
+	m.monitorLog("[SyncASINs] Product API returned %d products (requested %d)", returnedCount, len(asinStrings))
 
 	// Store product data and get successful ASINs
-	m.debugLog("[SyncASINs] Storing product data to databases...")
+	m.monitorLog("[SyncASINs] Writing product rows to the database...")
 	successfulASINs, returnedASINs := m.storeHourlyProductData(apiResponse, marketplace, requestedASINs)
-	m.debugLog("[SyncASINs] Successfully stored: %d ASINs", len(successfulASINs))
+	m.logASINList("[SyncASINs] Stored successfully", successfulASINs)
 
-	// Mark ASINs not returned by API as "product not found" (retry in 15 days)
+	// Mark ASINs not returned by API as "product not found"
+	// (retried after ProductNotFoundRetryDays)
 	notFoundCount := 0
 	var notFoundASINs []string
 	for asin := range requestedASINs {
@@ -1766,47 +2955,83 @@ func (m *HourlySyncManager) syncSelectedASINs(asins []ASINSyncInfo, marketplace 
 	}
 
 	if notFoundCount > 0 {
-		m.debugLog("[SyncASINs] %d ASINs NOT FOUND in JungleScout API (will retry in 15 days):", notFoundCount)
-		m.debugLog("[SyncASINs] Not found list: %v", notFoundASINs)
-		m.addHourlyError("api", fmt.Sprintf("%d ASINs not found in JungleScout API (will retry in 15 days)", notFoundCount))
+		m.logASINList(fmt.Sprintf("[SyncASINs] NOT FOUND in JungleScout (retry in %d days)", ProductNotFoundRetryDays), notFoundASINs)
+		m.addHourlyError("api", fmt.Sprintf("%d ASINs not found in JungleScout API (will retry in %d days)", notFoundCount, ProductNotFoundRetryDays))
 	}
 
-	m.statusMutex.Lock()
-	m.status.SuccessfulProductSync = len(successfulASINs)
-	m.status.FailedASINs = len(asins) - len(successfulASINs)
-	m.status.TotalASINsProcessed = len(asins)
-	m.statusMutex.Unlock()
+	// Product-level accounting. An ASIN whose product row was written is not
+	// resolved yet — its sales fetch still has to succeed — so it is only cleared
+	// from the failed set once sales completes. What is settled here is the
+	// opposite: ASINs the API did not return are failures for this run.
+	m.markASINAttempted(asinStrings...)
+	if notFoundCount > 0 {
+		m.markASINFailed(notFoundASINs...)
+	}
+	storedOK := make(map[string]bool, len(successfulASINs))
+	for _, asin := range successfulASINs {
+		storedOK[asin] = true
+	}
+	for asin := range requestedASINs {
+		// Returned by the API but not stored: a write problem, not a not-found.
+		if returnedASINs[asin] && !storedOK[asin] {
+			m.markASINFailed(asin)
+		}
+	}
 
-	m.debugLog("[SyncASINs] Product sync summary: %d success, %d failed, %d not found",
-		len(successfulASINs), len(asins)-len(successfulASINs)-notFoundCount, notFoundCount)
+	m.markProductStored(successfulASINs...)
+
+	m.monitorLog("[SyncASINs] Product sync summary: %d stored, %d failed, %d not found (of %d requested)",
+		len(successfulASINs), len(asins)-len(successfulASINs)-notFoundCount, notFoundCount, len(asins))
 
 	// Step 5: Sync sales data for successful ASINs only
-	m.debugLog("[SyncASINs] ===== STEP 5: SALES DATA FETCH =====")
-	m.debugLog("[SyncASINs] Fetching sales data for %d successful product ASINs using 5-worker pool...", len(successfulASINs))
-
+	m.monitorLog("[SyncASINs] ===== STEP 5: SALES DATA FETCH =====")
 	// Build map for quick lookup of ASIN info
 	asinInfoMap := make(map[string]ASINSyncInfo)
 	for _, info := range asins {
 		asinInfoMap[info.ASIN] = info
 	}
 
-	// Worker pool for concurrent sales fetching (same pattern as Master Sync)
+	// Drop ASINs whose full-year backfill was deferred by MAX_FULL_BACKFILLS. Their
+	// product data is already written; skipping the sales call leaves
+	// sales_estimate_data_synced_at NULL so the next run still sees the full year
+	// as outstanding.
+	salesTargets := make([]string, 0, len(successfulASINs))
+	deferredHere := 0
+	for _, asin := range successfulASINs {
+		if info, ok := asinInfoMap[asin]; ok && info.DeferSales {
+			deferredHere++
+			continue
+		}
+		salesTargets = append(salesTargets, asin)
+	}
+	if deferredHere > 0 {
+		m.monitorLog("[SyncASINs] %d ASINs skipped for sales this run (full-year backfill deferred)", deferredHere)
+	}
+
+	m.monitorLog("[SyncASINs] Fetching sales data for %d ASINs (1 API call each, %d workers)...",
+		len(salesTargets), SalesWorkerCount)
+
+	// Worker pool for concurrent sales fetching. All workers share the client's
+	// single 14 req/s rate limiter, so the pool size controls how much of that
+	// budget is used, not how fast requests leave — raising it cannot cause 429s.
 	var salesSuccessCount int32
 	var salesFailCount int32
-	workerCount := 5
-	asinChan := make(chan string, len(successfulASINs))
+	var salesRetryQueued int32
+	asinChan := make(chan string, len(salesTargets))
 	var wg sync.WaitGroup
 
 	// Start workers
-	for i := 0; i < workerCount; i++ {
+	for i := 0; i < SalesWorkerCount; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
 
 			for asin := range asinChan {
-				// Check if we should stop processing due to critical errors
+				// Only a genuinely unrecoverable condition stops the run now. A single
+				// failed row no longer sets stopRequested (see storeHourlySalesData),
+				// so reaching this means the database is effectively gone.
 				if m.stopRequested {
-					m.debugLog("[Worker %d] Stopping due to critical errors", workerID)
+					m.debugLog("[Worker %d] Stopping: run marked unrecoverable", workerID)
 					return
 				}
 
@@ -1829,7 +3054,7 @@ func (m *HourlySyncManager) syncSelectedASINs(asins []ASINSyncInfo, marketplace 
 					dateRangeDesc = fmt.Sprintf("since last sync (%s)", startDate)
 				}
 
-				m.debugLog("[Worker %d] Fetching sales for ASIN %s: %s to %s (%s)",
+				m.monitorLog("[Worker %d] Sales fetch %s: %s -> %s (%s)",
 					workerID, asin, startDate, endDate, dateRangeDesc)
 
 				salesResponse, err := m.jsClient.FetchSalesEstimateData(asin, marketplace, startDate, endDate)
@@ -1841,10 +3066,25 @@ func (m *HourlySyncManager) syncSelectedASINs(asins []ASINSyncInfo, marketplace 
 				m.statusMutex.Unlock()
 
 				if err != nil {
-					m.debugLog("[Worker %d] ERROR: Sales fetch for %s failed: %v", workerID, asin, err)
+					transient := isTransientAPIError(err)
+					lastChance := m.isRetryPass() // no further attempt is coming
+					log.Printf("%s [Worker %d] ERROR: Sales fetch for %s failed (transient=%v, final=%v): %v",
+						m.logPrefix(), workerID, asin, transient, lastChance, err)
 					m.addHourlyError("api", fmt.Sprintf("Sales fetch for %s failed: %v", asin, err))
-					m.updateHourlySyncStatus(asin, true, false, fmt.Sprintf("Sales fetch error: %v", err))
-					atomic.AddInt32(&salesFailCount, 1)
+
+					// Always count it against the run. markASINResolved clears this again
+					// if a later pass succeeds, so the total stays exact either way.
+					m.markASINFailed(asin)
+
+					if transient && !lastChance {
+						// Hold off on writing to sync_status: an error there reads as a
+						// settled outcome, and the retry pass may still succeed.
+						m.queueForRetry(info)
+						atomic.AddInt32(&salesRetryQueued, 1)
+					} else {
+						m.updateHourlySyncStatus(asin, true, false, fmt.Sprintf("Sales fetch error: %v", err))
+						atomic.AddInt32(&salesFailCount, 1)
+					}
 					continue
 				}
 
@@ -1852,18 +3092,33 @@ func (m *HourlySyncManager) syncSelectedASINs(asins []ASINSyncInfo, marketplace 
 				if salesResponse != nil && len(salesResponse.Data) > 0 {
 					dataPoints = len(salesResponse.Data[0].Attributes.Data)
 				}
-				m.debugLog("[Worker %d] Sales API returned %d data points for ASIN %s", workerID, dataPoints, asin)
 
 				if m.storeHourlySalesData(salesResponse, marketplace) {
-					atomic.AddInt32(&salesSuccessCount, 1)
-					m.debugLog("[Worker %d] Successfully stored sales data for ASIN %s", workerID, asin)
+					if m.markSalesStored(asin) {
+						atomic.AddInt32(&salesSuccessCount, 1)
+					}
+					// Fully done: product row written and sales stored. Clear any failure
+					// recorded for this ASIN on an earlier attempt.
+					m.markASINResolved(asin)
+					m.monitorLog("[Worker %d] %s OK: %d sales data points stored", workerID, asin, dataPoints)
 				} else {
-					atomic.AddInt32(&salesFailCount, 1)
-					m.debugLog("[Worker %d] Failed to store sales data for ASIN %s", workerID, asin)
+					m.markASINFailed(asin)
 
-					// Check if critical DB error occurred
+					// A write failure is retryable too: the upserts are idempotent, so a
+					// second attempt is safe and usually clears a transient DB hiccup.
+					if !m.isRetryPass() {
+						m.queueForRetry(info)
+						atomic.AddInt32(&salesRetryQueued, 1)
+						log.Printf("%s [Worker %d] %s FAILED to store sales data (%d data points returned) - queued for retry",
+							m.logPrefix(), workerID, asin, dataPoints)
+					} else {
+						atomic.AddInt32(&salesFailCount, 1)
+						log.Printf("%s [Worker %d] %s FAILED to store sales data on the final attempt (%d data points returned)",
+							m.logPrefix(), workerID, asin, dataPoints)
+					}
+
 					if m.stopRequested {
-						m.debugLog("[Worker %d] Stopping due to critical database error", workerID)
+						m.debugLog("[Worker %d] Stopping: run marked unrecoverable", workerID)
 						return
 					}
 				}
@@ -1872,7 +3127,7 @@ func (m *HourlySyncManager) syncSelectedASINs(asins []ASINSyncInfo, marketplace 
 	}
 
 	// Send ASINs to workers
-	for _, asin := range successfulASINs {
+	for _, asin := range salesTargets {
 		asinChan <- asin
 	}
 	close(asinChan)
@@ -1880,15 +3135,19 @@ func (m *HourlySyncManager) syncSelectedASINs(asins []ASINSyncInfo, marketplace 
 	// Wait for all workers to complete
 	wg.Wait()
 
-	m.statusMutex.Lock()
-	m.status.SuccessfulSalesSync = int(salesSuccessCount)
-	m.statusMutex.Unlock()
+	if queued := atomic.LoadInt32(&salesRetryQueued); queued > 0 {
+		m.monitorLog("[SyncASINs] %d ASINs queued for the end-of-run retry pass", queued)
+	}
 
-	m.debugLog("[SyncASINs] Sales sync summary: %d successful, %d failed", salesSuccessCount, salesFailCount)
-	m.debugLog("[SyncASINs] Total API calls made: %d", m.apiCallCount)
+	// SuccessfulSalesSync is maintained by markSalesStored, which is set-based so a
+	// retry that re-stores already-counted data does not inflate it. Nothing to
+	// accumulate here.
+	m.monitorLog("[SyncASINs] Sales sync summary: %d newly stored, %d failed", salesSuccessCount, salesFailCount)
+	m.monitorLog("[SyncASINs] Total API calls so far: %d", m.apiCallCount)
 }
 
-// markProductNotFound marks an ASIN as not found in JungleScout API (retry in 15 days)
+// markProductNotFound marks an ASIN as not found in JungleScout API. It will be
+// retried after ProductNotFoundRetryDays.
 // NOTE: sync_status is staging-only, production writes are skipped
 func (m *HourlySyncManager) markProductNotFound(asin string) {
 	m.debugLog("[NotFound] Marking ASIN %s as 'product not found' (will retry in %d days)", asin, ProductNotFoundRetryDays)
@@ -1923,7 +3182,10 @@ func (m *HourlySyncManager) storeHourlyProductData(apiResponse *junglescout.Prod
 
 	stagingProductTable := m.stagingClient.TableName("jungle_scout_product_data")
 	stagingStatusTable := m.stagingClient.TableName("jungle_scout_sync_status")
-	prodProductTable := m.productionClient.TableName("jungle_scout_product_data")
+	var prodProductTable string
+	if m.productionClient != nil {
+		prodProductTable = m.productionClient.TableName("jungle_scout_product_data")
+	}
 	reportDate := time.Now().Format("2006-01-02")
 
 	buildProductQuery := func(tableName string) string {
@@ -2034,27 +3296,52 @@ func (m *HourlySyncManager) storeHourlyProductData(apiResponse *junglescout.Prod
 		_, err := m.stagingClient.DB.Exec(buildProductQuery(stagingProductTable), productArgs...)
 		if err != nil {
 			m.addHourlyError("db", fmt.Sprintf("Staging product store for %s failed: %v", asin, err))
+			log.Printf("%s [Product] %s: staging write to %s FAILED: %v", m.logPrefix(), asin, stagingProductTable, err)
 			m.stagingClient.DB.Exec(buildStatusQuery(stagingStatusTable), asin, false, fmt.Sprintf("Failed: %v", err), nil)
 			continue
 		}
 		m.stagingClient.DB.Exec(buildStatusQuery(stagingStatusTable), asin, true, nil, time.Now())
 
-		// Production with retry (product_data only, sync_status is staging-only)
-		var prodErr error
-		for attempt := 1; attempt <= 3; attempt++ {
-			_, prodErr = m.productionClient.DB.Exec(buildProductQuery(prodProductTable), productArgs...)
-			if prodErr == nil {
-				break
+		// Production with retry (product_data only, sync_status is staging-only).
+		// Skipped entirely when running staging-only (no production client).
+		if m.productionClient != nil {
+			var prodErr error
+			for attempt := 1; attempt <= 3; attempt++ {
+				_, prodErr = m.productionClient.DB.Exec(buildProductQuery(prodProductTable), productArgs...)
+				if prodErr == nil {
+					break
+				}
+				if attempt < 3 {
+					time.Sleep(time.Duration(attempt) * time.Second)
+				}
 			}
-			if attempt < 3 {
-				time.Sleep(time.Duration(attempt) * time.Second)
+
+			if prodErr != nil {
+				m.addHourlyError("db", fmt.Sprintf("Production product store for %s failed: %v", asin, prodErr))
+				log.Printf("%s [Product] %s: production write to %s FAILED after 3 retries: %v",
+					m.logPrefix(), asin, prodProductTable, prodErr)
+				continue
 			}
 		}
 
-		if prodErr != nil {
-			m.addHourlyError("db", fmt.Sprintf("Production product store for %s failed: %v", asin, prodErr))
-			continue
+		// Copy this parent's row onto every child. Non-critical: the
+		// parent row is stored and the API call is not wasted.
+		stagingChildRows, fanErr := fanOutProductRow(m.stagingClient, m.stagingTables, asin, reportDate)
+		if fanErr != nil {
+			m.addHourlyError("db", fmt.Sprintf("Staging product fan-out for %s failed: %v", asin, fanErr))
+			log.Printf("%s [Product] WARNING: staging %v", m.logPrefix(), fanErr)
 		}
+
+		var prodChildRows int64
+		if m.productionClient != nil {
+			if prodChildRows, fanErr = fanOutProductRow(m.productionClient, m.prodTables, asin, reportDate); fanErr != nil {
+				m.addHourlyError("db", fmt.Sprintf("Production product fan-out for %s failed: %v", asin, fanErr))
+				log.Printf("%s [Product] WARNING: production %v", m.logPrefix(), fanErr)
+			}
+		}
+
+		m.monitorLog("[Product] %s stored (report_date=%s) | children copied: staging=%d production=%d",
+			asin, reportDate, stagingChildRows, prodChildRows)
 
 		successfulASINs = append(successfulASINs, asin)
 	}
@@ -2133,7 +3420,10 @@ func (m *HourlySyncManager) storeHourlySalesData(apiResponse *junglescout.SalesE
 
 	stagingSalesTable := m.stagingClient.TableName("jungle_scout_sales_estimate_data")
 	stagingStatusTable := m.stagingClient.TableName("jungle_scout_sync_status")
-	prodSalesTable := m.productionClient.TableName("jungle_scout_sales_estimate_data")
+	var prodSalesTable string
+	if m.productionClient != nil {
+		prodSalesTable = m.productionClient.TableName("jungle_scout_sales_estimate_data")
+	}
 
 	jsData := apiResponse.Data[0]
 	attrs := jsData.Attributes
@@ -2161,37 +3451,84 @@ func (m *HourlySyncManager) storeHourlySalesData(apiResponse *junglescout.SalesE
 
 	batchSize := 100 // Optimal batch size for PostgreSQL
 
+	// Earliest date in this response, used to bound the child fan-out to the window
+	// just fetched instead of re-copying the parent's whole history every run. Dates
+	// arrive as YYYY-MM-DD, so a lexicographic minimum is the chronological one.
+	minDate := ""
+	for _, dp := range dataPoints {
+		if dp.Date == "" {
+			continue
+		}
+		if minDate == "" || dp.Date < minDate {
+			minDate = dp.Date
+		}
+	}
+	if minDate == "" {
+		// No usable dates: fall back to the unbounded copy rather than silently
+		// skipping the fan-out, which would leave children behind.
+		m.debugLog("[Sales] %s: no dates in response, falling back to an unbounded fan-out", attrs.ASIN)
+	}
+
 	// Step 1: Batch insert to STAGING
 	stagingInserted, stagingErr := m.batchInsertSalesData(m.stagingClient.DB, stagingSalesTable, dataPoints, batchSize)
 	if stagingErr != nil {
 		m.addHourlyError("db", fmt.Sprintf("Staging sales batch insert for %s failed: %v", attrs.ASIN, stagingErr))
-		m.debugLog("[Sales] CRITICAL: Staging batch insert failed for %s: %v", attrs.ASIN, stagingErr)
-		m.stopRequested = true
+		log.Printf("%s [Sales] staging insert into %s failed for %s: %v",
+			m.logPrefix(), stagingSalesTable, attrs.ASIN, stagingErr)
+		// Returning false puts this ASIN on the retry queue. The run is only
+		// abandoned once failures stop being isolated.
+		m.noteDBFailure(fmt.Sprintf("staging sales insert for %s", attrs.ASIN), stagingErr)
 		return false
 	}
-	m.debugLog("[Sales] Staging: inserted %d data points for ASIN %s", stagingInserted, attrs.ASIN)
+	m.noteDBSuccess()
+	m.monitorLog("[Sales] %s: %d rows upserted into staging %s", attrs.ASIN, stagingInserted, stagingSalesTable)
 
-	// Step 2: Batch insert to PRODUCTION with retry
-	var prodErr error
-	var prodInserted int
-	for attempt := 1; attempt <= 3; attempt++ {
-		prodInserted, prodErr = m.batchInsertSalesData(m.productionClient.DB, prodSalesTable, dataPoints, batchSize)
-		if prodErr == nil {
-			break
+	// Step 2: Batch insert to PRODUCTION with retry.
+	// Skipped entirely when running staging-only (no production client).
+	if m.productionClient != nil {
+		var prodErr error
+		var prodInserted int
+		for attempt := 1; attempt <= 3; attempt++ {
+			prodInserted, prodErr = m.batchInsertSalesData(m.productionClient.DB, prodSalesTable, dataPoints, batchSize)
+			if prodErr == nil {
+				break
+			}
+			m.debugLog("[Sales] Production batch insert attempt %d for %s failed: %v", attempt, attrs.ASIN, prodErr)
+			if attempt < 3 {
+				time.Sleep(time.Duration(attempt) * time.Second)
+			}
 		}
-		m.debugLog("[Sales] Production batch insert attempt %d for %s failed: %v", attempt, attrs.ASIN, prodErr)
-		if attempt < 3 {
-			time.Sleep(time.Duration(attempt) * time.Second)
+
+		if prodErr != nil {
+			m.addHourlyError("db", fmt.Sprintf("Production sales batch insert for %s failed after 3 retries: %v", attrs.ASIN, prodErr))
+			log.Printf("%s [Sales] production insert into %s failed for %s after 3 retries: %v",
+				m.logPrefix(), prodSalesTable, attrs.ASIN, prodErr)
+			m.noteDBFailure(fmt.Sprintf("production sales insert for %s", attrs.ASIN), prodErr)
+			return false
 		}
+		m.noteDBSuccess()
+		m.monitorLog("[Sales] %s: %d rows upserted into production %s", attrs.ASIN, prodInserted, prodSalesTable)
 	}
 
-	if prodErr != nil {
-		m.addHourlyError("db", fmt.Sprintf("Production sales batch insert for %s failed after 3 retries: %v", attrs.ASIN, prodErr))
-		m.debugLog("[Sales] CRITICAL: Production batch insert failed for %s after 3 retries: %v", attrs.ASIN, prodErr)
-		m.stopRequested = true
-		return false
+	// Copy this parent's sales rows onto its children. Non-critical.
+	if stagingInserted > 0 {
+		stagingChildRows, fanErr := fanOutSalesRows(m.stagingClient, m.stagingTables, attrs.ASIN, marketplace, minDate)
+		if fanErr != nil {
+			m.addHourlyError("db", fmt.Sprintf("Staging sales fan-out for %s failed: %v", attrs.ASIN, fanErr))
+			log.Printf("%s [Sales] WARNING: staging %v", m.logPrefix(), fanErr)
+		}
+
+		var prodChildRows int64
+		if m.productionClient != nil {
+			if prodChildRows, fanErr = fanOutSalesRows(m.productionClient, m.prodTables, attrs.ASIN, marketplace, minDate); fanErr != nil {
+				m.addHourlyError("db", fmt.Sprintf("Production sales fan-out for %s failed: %v", attrs.ASIN, fanErr))
+				log.Printf("%s [Sales] WARNING: production %v", m.logPrefix(), fanErr)
+			}
+		}
+
+		m.monitorLog("[Sales] %s: child rows copied staging=%d production=%d",
+			attrs.ASIN, stagingChildRows, prodChildRows)
 	}
-	m.debugLog("[Sales] Production: inserted %d data points for ASIN %s", prodInserted, attrs.ASIN)
 
 	// Update sync_status (staging only)
 	if stagingInserted > 0 {
@@ -2315,6 +3652,7 @@ func (m *HourlySyncManager) sendHourlySyncDiscordNotification() {
 		{"name": "🧹 Cleaned", "value": fmt.Sprintf("%d", m.status.CleanedUpASINs), "inline": true},
 		{"name": "➕ Added", "value": fmt.Sprintf("%d", m.status.NewASINsAdded), "inline": true},
 		{"name": "🔌 API Calls", "value": fmt.Sprintf("%d", m.apiCallCount), "inline": true},
+		{"name": "🗂️ ASIN Source", "value": m.asinSourceLabel(), "inline": true},
 	}
 
 	// Add error breakdown if any

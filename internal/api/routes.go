@@ -36,6 +36,11 @@ func (s *Server) setupRoutes() {
 	{
 		// Hourly sync endpoint for cloud scheduler
 		cloudJobRoutes.POST("/hourly-sync", handlers.JSHourlySync(s.GetStagingClient(), s.GetProductionClient(), s.GetAPIUsageRecorder()))
+
+		// Manual hourly sync: same run, but the ASINs come from an uploaded CSV
+		// (multipart field "file") instead of the automatic selection.
+		cloudJobRoutes.POST("/hourly-sync/manual", handlers.JSManualHourlySync(s.GetStagingClient(), s.GetProductionClient(), s.GetAPIUsageRecorder()))
+
 		cloudJobRoutes.GET("/hourly-sync/status", handlers.GetJSHourlySyncStatus(s.GetStagingClient(), s.GetProductionClient()))
 	}
 
