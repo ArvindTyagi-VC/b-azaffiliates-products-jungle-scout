@@ -144,23 +144,13 @@ func TestASINAccountingResolveIsSafeWhenNothingFailed(t *testing.T) {
 	}
 }
 
-func TestProductAndSalesStoredCountDistinct(t *testing.T) {
+func TestProductStoredCountDistinct(t *testing.T) {
 	m := newTestManager()
 
 	m.markProductStored("A", "B")
 	m.markProductStored("A") // retry re-runs the batched product call
 	if got := m.status.SuccessfulProductSync; got != 2 {
 		t.Errorf("SuccessfulProductSync = %d, want 2", got)
-	}
-
-	if fresh := m.markSalesStored("A"); !fresh {
-		t.Error("markSalesStored first call = false, want true")
-	}
-	if fresh := m.markSalesStored("A"); fresh {
-		t.Error("markSalesStored repeat call = true, want false")
-	}
-	if got := m.status.SuccessfulSalesSync; got != 1 {
-		t.Errorf("SuccessfulSalesSync = %d, want 1", got)
 	}
 }
 

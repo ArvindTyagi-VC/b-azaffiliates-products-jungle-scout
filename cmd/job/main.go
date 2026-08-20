@@ -130,10 +130,9 @@ func main() {
 	log.Printf("=== Sync Completed ===")
 	log.Printf("Total ASINs Processed  : %d", status.TotalASINsProcessed)
 	log.Printf("Successful Product Sync: %d", status.SuccessfulProductSync)
-	log.Printf("Successful Sales Sync  : %d", status.SuccessfulSalesSync)
-	log.Printf("Sales-gap Re-drives    : %d", status.SalesGapASINs)
+	log.Printf("New ASINs Synced       : %d", status.NewASINsSynced)
+	log.Printf("Stale ASINs Synced     : %d", status.StaleASINsSynced)
 	log.Printf("Retried / Recovered    : %d / %d", status.RetriedASINs, status.RecoveredASINs)
-	log.Printf("Deferred Backfills     : %d", status.DeferredBackfills)
 	log.Printf("Failed ASINs           : %d", status.FailedASINs)
 	log.Printf("Total API Calls        : %d", status.TotalAPICalls)
 

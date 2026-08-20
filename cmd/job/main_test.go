@@ -14,7 +14,6 @@ func TestExitCodeForHealthyRun(t *testing.T) {
 	status := handlers.HourlySyncStatus{
 		TotalASINsProcessed:   77000,
 		SuccessfulProductSync: 77000,
-		SuccessfulSalesSync:   76900,
 		FailedASINs:           0,
 	}
 
@@ -71,7 +70,6 @@ func TestExitCodeForThrottledRunIsHealthy(t *testing.T) {
 	status := handlers.HourlySyncStatus{
 		TotalASINsProcessed:   500,
 		SuccessfulProductSync: 500,
-		SuccessfulSalesSync:   500,
 		FailedASINs:           0,
 		ThrottledPerRun:       true,
 		LimitReached:          false,
