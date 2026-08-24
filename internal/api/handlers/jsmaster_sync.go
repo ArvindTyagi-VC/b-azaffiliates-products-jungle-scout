@@ -90,13 +90,18 @@ const ProductBatchSize = 100
 // (sync on the 1st, 11th and 21st) that replaced the original hourly schedule.
 //
 // The old hourly values were HourlySyncASINLimit=100, StaleDataThresholdDays=30
-// and ProductNotFoundRetryDays=15. Those three are tuned to each other and to the
-// schedule: at 100 ASINs an hour the parent set came round about once a month,
+// and ProductNotFoundRetryDays=15. Those three were tuned to each other and to
+// the schedule: at 100 ASINs an hour the parent set came round about once a month,
 // which is why staleness was 30 days. On a ten-day cycle one run must cover the
-// whole parent set, so the limit becomes a runaway guard rather than a slice size
-// and the two day-thresholds have to drop to the cycle length. Changing the cron
-// without changing StaleDataThresholdDays makes the 2nd and 3rd run of each month
-// select nothing at all.
+// whole parent set, so the limit became a runaway guard rather than a slice size.
+//
+// The staleness gate is now OFF by default (StaleDataThresholdDays=0): every run
+// refreshes every parent ASIN in sync_status regardless of how recently it was
+// fetched, so the cron cadence and the day-threshold are no longer coupled and a
+// run can no longer select nothing because "nothing is stale yet". The retry
+// windows are unchanged — ProductNotFoundRetryDays still holds back ASINs
+// JungleScout does not know about, and SalesRetryPasses still re-drives transient
+// failures inside the run.
 var (
 	// HourlySyncASINLimit caps one run. It is a guard, not a target: it sits above
 	// the parent set so a healthy run is never truncated, and exists so a corrupted
@@ -144,9 +149,20 @@ var (
 	//   SYNC_MAX_PER_RUN=10 go run ./cmd/job
 	SyncMaxPerRun = envInt("SYNC_MAX_PER_RUN", 0)
 
-	// StaleDataThresholdDays is how old product data may be before it is refetched.
-	// Must match the schedule interval.
-	StaleDataThresholdDays = envInt("STALE_THRESHOLD_DAYS", 10)
+	// StaleDataThresholdDays is an OPTIONAL age gate on the refresh tier: only
+	// ASINs whose product data is older than this many days are refetched.
+	//
+	// Default 0 turns the gate OFF, which is the production setting: every run
+	// refreshes every parent ASIN in sync_status, however recently it was fetched.
+	// That is what the scheduled job is for — the first run covers the whole parent
+	// set and so does every run after it, with the not-found and transient-failure
+	// retries layered on top exactly as before.
+	//
+	// Set it above 0 only to deliberately skip recently-fetched ASINs (spreading
+	// API spend, a catch-up run after an outage). Beware the old coupling when you
+	// do: a value larger than the cron interval makes runs inside that window
+	// select nothing at all.
+	StaleDataThresholdDays = envInt("STALE_THRESHOLD_DAYS", 0)
 
 	// ProductNotFoundRetryDays is how long an ASIN that JungleScout does not know
 	// about is left alone. Keep it at or below the cycle length: a value above it
@@ -212,6 +228,12 @@ func LogSyncTuning() {
 	log.Printf("[CONFIG] SYNC_ASIN_LIMIT=%d SYNC_MAX_PER_RUN=%d STALE_THRESHOLD_DAYS=%d NOT_FOUND_RETRY_DAYS=%d MAX_FAILURE_RATE=%.2f RETRY_PASSES=%d",
 		HourlySyncASINLimit, SyncMaxPerRun, StaleDataThresholdDays, ProductNotFoundRetryDays,
 		MaxFailureRate, SalesRetryPasses)
+
+	if StaleDataThresholdDays <= 0 {
+		log.Printf("[CONFIG] STALE_THRESHOLD_DAYS=%d — staleness gate OFF: every run refreshes every parent ASIN in sync_status (not-found and transient-failure retries still apply)",
+			StaleDataThresholdDays)
+		return
+	}
 
 	if StaleDataThresholdDays < ProductNotFoundRetryDays {
 		log.Printf("[CONFIG] WARNING: NOT_FOUND_RETRY_DAYS (%d) exceeds STALE_THRESHOLD_DAYS (%d) — ASINs missing from JungleScout will be skipped on the next run and only retried on the one after",
@@ -2297,8 +2319,13 @@ func (m *HourlySyncManager) RunHourlySync(marketplace string) {
 
 		// ==================== STEP 3: SELECT ASINs ====================
 		m.debugLog("---------- STEP 3: SELECT ASINs ----------")
-		m.debugLog("Selecting up to %d ASINs (priority: new first, then stale >%d days)...",
-			HourlySyncASINLimit, StaleDataThresholdDays)
+		if StaleDataThresholdDays > 0 {
+			m.debugLog("Selecting up to %d ASINs (priority: new first, then stale >%d days)...",
+				HourlySyncASINLimit, StaleDataThresholdDays)
+		} else {
+			m.debugLog("Selecting up to %d ASINs (new first, then every already-fetched parent ASIN — no staleness gate)...",
+				HourlySyncASINLimit)
+		}
 		asinsToSync, err = m.selectASINsToSync()
 		if err != nil {
 			m.addHourlyError("db", fmt.Sprintf("Failed to select ASINs: %v", err))
@@ -2312,12 +2339,20 @@ func (m *HourlySyncManager) RunHourlySync(marketplace string) {
 	}
 
 	if len(asinsToSync) == 0 {
-		m.debugLog("No ASINs to sync (all data is fresh)")
+		if StaleDataThresholdDays > 0 {
+			m.debugLog("No ASINs to sync (all data is newer than the %d-day staleness threshold)", StaleDataThresholdDays)
+		} else {
+			// With the staleness gate off an empty selection is not "everything is
+			// fresh" — it means sync_status itself is empty, or every row is a
+			// not-found ASIN still inside its retry window.
+			m.debugLog("No ASINs to sync: sync_status has no eligible rows (staleness gate is off, so this is empty table or all rows inside the %d-day not-found retry window)",
+				ProductNotFoundRetryDays)
+		}
 		m.debugLog("========== HOURLY SYNC SKIPPED (NO WORK) ==========")
 		return
 	}
 
-	// Count new vs stale
+	// Count new vs refreshed
 	newCount, staleCount := 0, 0
 	var newASINsList, staleASINsList []string
 	for _, info := range asinsToSync {
@@ -2334,13 +2369,18 @@ func (m *HourlySyncManager) RunHourlySync(marketplace string) {
 	m.status.StaleASINsSynced = staleCount
 	m.statusMutex.Unlock()
 
-	m.monitorLog("To sync: %d ASINs total (%d never fetched, %d product data stale >%d days)",
-		len(asinsToSync), newCount, staleCount, StaleDataThresholdDays)
+	if StaleDataThresholdDays > 0 {
+		m.monitorLog("To sync: %d ASINs total (%d never fetched, %d product data stale >%d days)",
+			len(asinsToSync), newCount, staleCount, StaleDataThresholdDays)
+	} else {
+		m.monitorLog("To sync: %d ASINs total (%d never fetched, %d refreshed regardless of age)",
+			len(asinsToSync), newCount, staleCount)
+	}
 	if len(newASINsList) > 0 {
 		m.debugLog("  - New ASIN list: %v", newASINsList)
 	}
 	if len(staleASINsList) > 0 {
-		m.debugLog("  - Stale ASIN list: %v", staleASINsList)
+		m.debugLog("  - Refresh ASIN list: %v", staleASINsList)
 	}
 
 	// ==================== STEP 4: SYNC PRODUCT DATA ====================
@@ -2613,11 +2653,29 @@ func scanASINSyncInfo(rows *sql.Rows) ([]ASINSyncInfo, error) {
 	return out, nil
 }
 
+// refreshTierPredicate builds the WHERE clause for the refresh tier of
+// selectASINsToSync, along with the query args it needs.
+//
+// With StaleDataThresholdDays at its default 0 the clause is just
+// has_product_data = true: every already-fetched parent ASIN is refetched on every
+// run. Above 0 the age predicate is added back, which also drops rows whose
+// product_data_synced_at is NULL — their age cannot be compared to a threshold.
+func refreshTierPredicate(staleThreshold time.Time) (string, []interface{}) {
+	if StaleDataThresholdDays <= 0 {
+		return "has_product_data = true", nil
+	}
+	return "has_product_data = true AND product_data_synced_at IS NOT NULL AND product_data_synced_at < $1",
+		[]interface{}{staleThreshold}
+}
+
 // selectASINsToSync picks the ASINs one run will process, in two tiers:
 //
 //  1. NEW — never fetched, or previously not found in JungleScout and past the
 //     retry window.
-//  2. STALE — product data older than StaleDataThresholdDays.
+//  2. REFRESH — everything already fetched. By default this is unconditional:
+//     every parent ASIN is refetched on every run, however recently it was last
+//     synced. Setting STALE_THRESHOLD_DAYS above 0 narrows it back to rows whose
+//     product data is older than that many days.
 //
 // A third tier used to re-drive ASINs whose product data was current but whose
 // sales fetch had failed. It went with the sales-estimate fetch itself: the
@@ -2625,19 +2683,25 @@ func scanASINSyncInfo(rows *sql.Rows) ([]ASINSyncInfo, error) {
 // product row is the whole job and there is no second stage to be missing.
 //
 // The two tiers are disjoint by construction (tier 1 requires
-// has_product_data=false, tier 2 requires a non-NULL product_data_synced_at
-// below the threshold), but the results are still de-duplicated by ASIN so a
-// future edit to either predicate cannot produce the same ASIN twice.
+// has_product_data=false, tier 2 requires has_product_data=true), but the results
+// are still de-duplicated by ASIN so a future edit to either predicate cannot
+// produce the same ASIN twice.
 func (m *HourlySyncManager) selectASINsToSync() ([]ASINSyncInfo, error) {
 	syncTable := m.stagingClient.TableName("jungle_scout_sync_status")
 	retryThreshold := time.Now().AddDate(0, 0, -ProductNotFoundRetryDays)
 	staleThreshold := time.Now().AddDate(0, 0, -StaleDataThresholdDays)
+	staleGateOn := StaleDataThresholdDays > 0
 
 	m.debugLog("[Select] Sync table: %s", syncTable)
 	m.debugLog("[Select] Not-found retry threshold (%d days): %s",
 		ProductNotFoundRetryDays, retryThreshold.Format("2006-01-02 15:04:05"))
-	m.debugLog("[Select] Stale threshold (%d days): %s",
-		StaleDataThresholdDays, staleThreshold.Format("2006-01-02 15:04:05"))
+	if staleGateOn {
+		m.debugLog("[Select] Stale threshold (%d days): %s — only ASINs last synced before this are refreshed",
+			StaleDataThresholdDays, staleThreshold.Format("2006-01-02 15:04:05"))
+	} else {
+		m.monitorLog("[Select] Staleness gate OFF (STALE_THRESHOLD_DAYS=%d) — refreshing EVERY already-fetched parent ASIN, not just stale ones",
+			StaleDataThresholdDays)
+	}
 
 	var results []ASINSyncInfo
 	seen := make(map[string]bool)
@@ -2691,28 +2755,38 @@ func (m *HourlySyncManager) selectASINsToSync() ([]ASINSyncInfo, error) {
 	newCount := add(newBatch, true)
 	m.debugLog("[Select] Found %d NEW ASINs", newCount)
 
-	// ---- Tier 2: product data older than the staleness threshold ----
+	// ---- Tier 2: refresh already-fetched ASINs ----
+	// Unconditional by default: an ASIN that already has product data is refetched
+	// no matter when it was last synced, so one run covers the whole parent set.
+	// With the gate on, the age predicate is added back and rows never stamped with
+	// a sync time (has_product_data=true, product_data_synced_at NULL) are excluded
+	// because their age is unknowable; with it off they are selected first, since an
+	// unknown age is the strongest reason to refetch.
 	if remaining := limit - len(results); remaining > 0 {
-		m.debugLog("[Select] Querying STALE ASINs (%d slots remaining)...", remaining)
+		refreshWhere, refreshArgs := refreshTierPredicate(staleThreshold)
+		if staleGateOn {
+			m.debugLog("[Select] Querying STALE ASINs (%d slots remaining)...", remaining)
+		} else {
+			m.debugLog("[Select] Querying ALL already-fetched ASINs to refresh (%d slots remaining)...", remaining)
+		}
+
 		staleRows, err := m.stagingClient.DB.Query(fmt.Sprintf(`
 			SELECT asin
 			FROM %s
-			WHERE has_product_data = true
-			AND product_data_synced_at IS NOT NULL
-			AND product_data_synced_at < $1
-			ORDER BY product_data_synced_at ASC
+			WHERE %s
+			ORDER BY product_data_synced_at ASC NULLS FIRST
 			LIMIT %d
-		`, syncTable, remaining), staleThreshold)
+		`, syncTable, refreshWhere, remaining), refreshArgs...)
 		if err != nil {
-			m.debugLog("[Select] ERROR: Failed to query stale ASINs: %v", err)
-			return nil, fmt.Errorf("failed to query stale ASINs: %w", err)
+			m.debugLog("[Select] ERROR: Failed to query ASINs to refresh: %v", err)
+			return nil, fmt.Errorf("failed to query ASINs to refresh: %w", err)
 		}
 		staleBatch, err := scanASINSyncInfo(staleRows)
 		if err != nil {
 			m.debugLog("[Select] ERROR: %v", err)
-			return nil, fmt.Errorf("stale ASINs: %w", err)
+			return nil, fmt.Errorf("ASINs to refresh: %w", err)
 		}
-		m.debugLog("[Select] Found %d STALE ASINs", add(staleBatch, false))
+		m.debugLog("[Select] Found %d ASINs to REFRESH", add(staleBatch, false))
 	}
 
 	// A run that reaches the cap has been truncated. The cap sits far above the
@@ -3111,7 +3185,7 @@ func (m *HourlySyncManager) sendHourlySyncDiscordNotification() {
 	fields := []map[string]interface{}{
 		{"name": "📊 Processed", "value": fmt.Sprintf("%d ASINs", m.status.TotalASINsProcessed), "inline": true},
 		{"name": "🆕 New", "value": fmt.Sprintf("%d", m.status.NewASINsSynced), "inline": true},
-		{"name": "🔄 Stale", "value": fmt.Sprintf("%d", m.status.StaleASINsSynced), "inline": true},
+		{"name": "🔄 Refreshed", "value": fmt.Sprintf("%d", m.status.StaleASINsSynced), "inline": true},
 		{"name": "📦 Product", "value": fmt.Sprintf("%d ✓ | %d ✗", m.status.SuccessfulProductSync, m.status.TotalASINsProcessed-m.status.SuccessfulProductSync), "inline": true},
 		{"name": "⏱️ Duration", "value": duration.String(), "inline": true},
 		{"name": "🧹 Cleaned", "value": fmt.Sprintf("%d", m.status.CleanedUpASINs), "inline": true},

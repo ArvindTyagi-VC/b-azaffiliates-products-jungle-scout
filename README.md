@@ -160,7 +160,7 @@ These were hardcoded constants; they are now environment variables so a cadence 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SYNC_ASIN_LIMIT` | `150000` | Max ASINs per run. A **runaway guard**, not a slice size — it sits above the parent set (107,032 measured 2026-08-19) so a healthy run is never truncated. A run that reaches it exits non-zero. **Revisit as the catalogue grows:** once the parent set passes the cap, every run truncates and fails. |
-| `STALE_THRESHOLD_DAYS` | `10` | How old product data may be before it is refetched. **Must match the schedule interval** — see the warning below. |
+| `STALE_THRESHOLD_DAYS` | `0` | Optional age gate on the refresh tier. `0` = **gate off**: every run refetches every parent ASIN in `sync_status`, however recently it was synced. Above 0, only ASINs last synced more than that many days ago are refreshed — see the warning below. |
 | `NOT_FOUND_RETRY_DAYS` | `10` | How long an ASIN JungleScout does not know about is left alone. Keep at or below the cycle length. |
 | `SALES_WORKERS` | `12` | Sales-fetch worker pool size. All workers share one 14 req/s rate limiter, so raising this fills the existing budget rather than exceeding it. |
 | `MAX_FAILURE_RATE` | `0.10` | Share of ASINs that may fail before the job exits non-zero. |
@@ -169,7 +169,9 @@ These were hardcoded constants; they are now environment variables so a cadence 
 | `MAX_CONSECUTIVE_DB_FAILURES` | `25` | Database write failures in a row before the run is abandoned. A single failure is retried instead of ending the run. |
 | `DEBUG_MODE` | `false` | Verbose logging. Set to `true` to enable. |
 
-> **Cadence warning:** `STALE_THRESHOLD_DAYS` and the cron schedule are coupled. If the cron runs every 10 days but the threshold is left at 30, the first run of the month works and **the next two select zero ASINs** — nothing is stale yet. The job logs "no ASINs to sync" and exits successfully. `LogSyncTuning()` prints the resolved values at the start of every run for exactly this reason.
+> **Full refresh every run:** with the default `STALE_THRESHOLD_DAYS=0` the staleness gate is off, so the very first scheduled run fetches JungleScout data for the whole parent set and so does every run after it. The retry behaviour is unchanged: `NOT_FOUND_RETRY_DAYS` still holds back ASINs JungleScout does not know about, and `SALES_RETRY_PASSES` still re-drives transient failures inside the run.
+>
+> **Cadence warning (only when you set the gate above 0):** a non-zero `STALE_THRESHOLD_DAYS` is coupled to the cron schedule. If the cron runs every 10 days but the threshold is 30, the first run of the month works and **the next two select zero ASINs** — nothing is stale yet. The job logs "no ASINs to sync" and exits successfully. `LogSyncTuning()` prints the resolved values at the start of every run for exactly this reason.
 
 ### Scheduling
 
@@ -552,7 +554,7 @@ The hourly sync is designed for cloud scheduler execution, processing up to **10
 | Constant | Value | Description |
 |----------|-------|-------------|
 | `HourlySyncASINLimit` | 100 | Max ASINs per hourly sync |
-| `StaleDataThresholdDays` | 30 | Days before data is considered stale |
+| `StaleDataThresholdDays` | 0 | Optional age gate; `0` = refresh every ASIN every run |
 | `ProductNotFoundRetryDays` | 15 | Days before retrying not-found ASINs |
 | `ProductBatchSize` | 100 | Max ASINs per product API call |
 | `SalesWorkerCount` | 5 | Concurrent workers for sales data fetching |
