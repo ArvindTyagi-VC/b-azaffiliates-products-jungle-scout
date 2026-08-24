@@ -56,7 +56,9 @@ grep -cE "log\.Printf|monitorLog\(|debugLog\(" internal/api/handlers/jsmaster_sy
    ASINs with no mapping row (treated as their own parent).
 3. **Select** (`selectASINsToSync`, three disjoint tiers, deduped by ASIN):
    - tier 1: never fetched, or past the not-found retry window (`NOT_FOUND_RETRY_DAYS` = 10)
-   - tier 2: `product_data_synced_at` older than `STALE_THRESHOLD_DAYS` (10)
+   - tier 2: every `has_product_data = true` row, refreshed regardless of age
+     (`STALE_THRESHOLD_DAYS` = 0 → gate off; set it above 0 to require
+     `product_data_synced_at` older than that many days)
    - tier 3: product fresh but `has_sales_data = false`
 4. **Fetch** — product data batched 100/request (API hard cap); sales estimates via
    12 workers on one 14 req/s limiter. Sales window: never-synced → **1 year** back to

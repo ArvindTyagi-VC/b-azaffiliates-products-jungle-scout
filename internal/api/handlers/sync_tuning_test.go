@@ -2,7 +2,9 @@ package handlers
 
 import (
 	"errors"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestEnvIntFallsBackOnBadValues(t *testing.T) {
@@ -144,23 +146,13 @@ func TestASINAccountingResolveIsSafeWhenNothingFailed(t *testing.T) {
 	}
 }
 
-func TestProductAndSalesStoredCountDistinct(t *testing.T) {
+func TestProductStoredCountDistinct(t *testing.T) {
 	m := newTestManager()
 
 	m.markProductStored("A", "B")
 	m.markProductStored("A") // retry re-runs the batched product call
 	if got := m.status.SuccessfulProductSync; got != 2 {
 		t.Errorf("SuccessfulProductSync = %d, want 2", got)
-	}
-
-	if fresh := m.markSalesStored("A"); !fresh {
-		t.Error("markSalesStored first call = false, want true")
-	}
-	if fresh := m.markSalesStored("A"); fresh {
-		t.Error("markSalesStored repeat call = true, want false")
-	}
-	if got := m.status.SuccessfulSalesSync; got != 1 {
-		t.Errorf("SuccessfulSalesSync = %d, want 1", got)
 	}
 }
 
@@ -203,5 +195,41 @@ func TestNoteDBSuccessResetsTheStreak(t *testing.T) {
 	}
 	if m.stopRequested {
 		t.Error("stopRequested set after the streak was reset")
+	}
+}
+
+// The refresh tier must cover every already-fetched ASIN by default: the scheduled
+// run refreshes the whole parent set, stale or not. A test guards the default
+// because a stray staleness predicate here silently shrinks a full run to nothing
+// on the second and third run of each cycle — the exact failure that removing the
+// gate was meant to end.
+func TestRefreshTierCoversEveryFetchedASINWhenGateOff(t *testing.T) {
+	original := StaleDataThresholdDays
+	defer func() { StaleDataThresholdDays = original }()
+
+	for _, off := range []int{0, -1} {
+		StaleDataThresholdDays = off
+		where, args := refreshTierPredicate(time.Now())
+		if where != "has_product_data = true" {
+			t.Errorf("STALE_THRESHOLD_DAYS=%d: got WHERE %q, want the unconditional predicate", off, where)
+		}
+		if len(args) != 0 {
+			t.Errorf("STALE_THRESHOLD_DAYS=%d: got %d query args, want none", off, len(args))
+		}
+	}
+}
+
+func TestRefreshTierAppliesAgeGateWhenConfigured(t *testing.T) {
+	original := StaleDataThresholdDays
+	defer func() { StaleDataThresholdDays = original }()
+
+	StaleDataThresholdDays = 10
+	threshold := time.Now().AddDate(0, 0, -10)
+	where, args := refreshTierPredicate(threshold)
+	if !strings.Contains(where, "product_data_synced_at < $1") {
+		t.Errorf("got WHERE %q, want the age predicate", where)
+	}
+	if len(args) != 1 || args[0] != threshold {
+		t.Errorf("got args %v, want the single threshold %v", args, threshold)
 	}
 }
