@@ -16,6 +16,7 @@ import (
 
 	"azaffiliates/internal/database"
 	"azaffiliates/internal/junglescout"
+	"azaffiliates/internal/promote"
 
 	"github.com/gin-gonic/gin"
 	"github.com/lib/pq"
@@ -2122,7 +2123,19 @@ func runHourlySyncHandler(stagingClient, productionClient *database.PostgreSQLCl
 		marketplace := paramOrDefault(c, "marketplace", "us")
 		debugMode := paramOrDefault(c, "debug", "false") == "true"
 
-		globalHourlySyncManager = NewHourlySyncManager(stagingClient, productionClient, debugMode, recorder)
+		// The publish tail and the sync's inline dual-write are mutually
+		// exclusive: whichever is live is the only path that writes production.
+		// Same rule as the Cloud Run Job in cmd/job.
+		promoteCfg := promote.LoadConfig()
+		promoteCfg.Log()
+		publishing := promoteCfg.Enabled && productionClient != nil
+		syncMirror := productionClient
+		if publishing {
+			syncMirror = nil
+			log.Println("[HOURLY_SYNC] Publish tail ENABLED — inline dual-write disabled for this run")
+		}
+
+		globalHourlySyncManager = NewHourlySyncManager(stagingClient, syncMirror, debugMode, recorder)
 		if isManual {
 			globalHourlySyncManager.isManual = true
 			globalHourlySyncManager.manualASINs = upload.ASINs
@@ -2135,9 +2148,39 @@ func runHourlySyncHandler(stagingClient, productionClient *database.PostgreSQLCl
 			log.Printf("[HOURLY_SYNC] Starting hourly sync with marketplace=%s, manual=%v", marketplace, isManual)
 		}
 
+		// The floor must be read before the sync writes anything — on a first
+		// publish it is what limits the copy to this run's rows.
+		ctx := c.Request.Context()
+		var floor promote.Floor
+		if publishing {
+			captured, err := promote.CaptureFloor(ctx, stagingClient)
+			if err != nil {
+				log.Printf("[HOURLY_SYNC] CRITICAL: could not capture the publish floor, the tail will be skipped: %v", err)
+				publishing = false
+			}
+			floor = captured
+		}
+
 		// Run sync synchronously (cloud jobs expect completion)
 		startedAt := time.Now()
 		globalHourlySyncManager.RunHourlySync(marketplace)
+
+		// Publish tail: copy what this run wrote in staging into production.
+		// Skipped when the run was unhealthy, so a partial sync cannot be
+		// published over live data.
+		var publishReport *promote.Report
+		if publishing {
+			status := globalHourlySyncManager.GetStatus()
+			if status.StoppedEarly || status.LimitReached {
+				log.Println("[HOURLY_SYNC] Publish tail SKIPPED — the run was not healthy, production is left untouched")
+			} else {
+				report := promote.New(stagingClient, productionClient, promoteCfg).Run(ctx, floor)
+				publishReport = &report
+				if err := report.Err(); err != nil {
+					log.Printf("[HOURLY_SYNC] FAILED: publish to production: %v", err)
+				}
+			}
+		}
 
 		if isManual {
 			status := globalHourlySyncManager.GetStatus()
@@ -2162,6 +2205,17 @@ func runHourlySyncHandler(stagingClient, productionClient *database.PostgreSQLCl
 			"debug_mode": debugMode,
 			"is_manual":  isManual,
 		}
+		if publishReport != nil {
+			publish := gin.H{
+				"rows_sent": publishReport.RowsSent(),
+				"duration":  publishReport.Duration.Round(time.Second).String(),
+				"tables":    publishTableSummaries(*publishReport),
+			}
+			if err := publishReport.Err(); err != nil {
+				publish["error"] = err.Error()
+			}
+			response["publish_to_production"] = publish
+		}
 		if isManual {
 			response["message"] = fmt.Sprintf("Manual hourly sync completed for %d ASINs from the uploaded CSV", len(upload.ASINs))
 			response["upload"] = upload
@@ -2169,6 +2223,30 @@ func runHourlySyncHandler(stagingClient, productionClient *database.PostgreSQLCl
 
 		c.JSON(200, response)
 	}
+}
+
+// publishTableSummaries renders a publish report for the HTTP response, so a
+// caller sees what reached production without going to the logs.
+func publishTableSummaries(report promote.Report) []gin.H {
+	summaries := make([]gin.H, 0, len(report.Tables))
+	for _, t := range report.Tables {
+		summary := gin.H{
+			"table":     t.Table,
+			"rows_read": t.RowsRead,
+			"rows_sent": t.RowsSent,
+			// Rows the target kept because its own copy was newer — the product
+			// page's "Load graph" refresh writing the same rows from the other side.
+			"rows_guarded": t.RowsGuarded,
+			"rows_written": t.RowsSent - t.RowsGuarded,
+			"watermark":    t.Watermark,
+			"throttled":    t.Throttled,
+		}
+		if t.Err != nil {
+			summary["error"] = t.Err.Error()
+		}
+		summaries = append(summaries, summary)
+	}
+	return summaries
 }
 
 // GetJSHourlySyncStatus returns the current hourly sync status

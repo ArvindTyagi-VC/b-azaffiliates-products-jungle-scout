@@ -19,10 +19,12 @@ import (
 	"context"
 	"log"
 	"os"
+	"time"
 
 	"azaffiliates/internal/api/handlers"
 	"azaffiliates/internal/database"
 	"azaffiliates/internal/junglescout"
+	"azaffiliates/internal/promote"
 )
 
 // syncAdvisoryLockKey identifies the advisory lock that serialises sync runs. Any
@@ -44,6 +46,12 @@ func main() {
 
 	log.Printf("Configuration: marketplace=%s, debug=%v", marketplace, debugMode)
 	handlers.LogSyncTuning()
+
+	// The publish tail copies what this run wrote in staging into the same
+	// tables in production, after the sync finishes.
+	promoteCfg := promote.LoadConfig()
+	promoteCfg.Log()
+	promoteOnly := os.Getenv("PROMOTE_ONLY") == "true"
 
 	// Initialize Staging PostgreSQL client
 	log.Println("Initializing Staging PostgreSQL client...")
@@ -118,9 +126,55 @@ func main() {
 	// Build the JungleScout API usage recorder (dual-write).
 	apiUsageRecorder := junglescout.NewDBAPIUsageRecorder(stagingClient, productionClient)
 
+	// Decide which of the two production write paths is live. They are mutually
+	// exclusive by design: the sync's inline dual-write puts every row on the
+	// wire twice, which on a full-set run is a second round-trip per row for
+	// ~22 hours, and it leaves nothing behind to reconcile with if production
+	// was unreachable mid-run. When the publish tail is enabled it takes over,
+	// and the sync writes staging only.
+	publishing := promoteCfg.Enabled && productionClient != nil
+	syncMirror := productionClient
+	if publishing {
+		syncMirror = nil
+		log.Println("Publish tail ENABLED — inline dual-write disabled; production is written once, after the sync")
+	} else if promoteCfg.Enabled {
+		log.Println("PROMOTE_ENABLED is set but DB_PROD_HOST is not — nothing to publish to, the tail will be skipped")
+	}
+
+	// The floor has to be read BEFORE the sync writes anything: on the very
+	// first publish it is what confines the copy to this run's rows instead of
+	// the whole table. Afterwards the stored bookmark takes over.
+	var floor promote.Floor
+	if publishing {
+		floor, err = promote.CaptureFloor(ctx, stagingClient)
+		if err != nil {
+			// Not fatal to the sync — but without a floor a first publish has no
+			// lower bound, so the tail is dropped rather than left to guess.
+			log.Printf("CRITICAL: could not capture the publish floor, the tail will be skipped: %v", err)
+			publishing = false
+		}
+	}
+
+	if promoteOnly {
+		// Re-publish without re-syncing. Used to catch production up after an
+		// outage, or to finish a tail that was cut short.
+		log.Println("PROMOTE_ONLY=true — skipping the sync, publishing only")
+		if !publishing {
+			log.Println("FATAL: PROMOTE_ONLY requires PROMOTE_ENABLED=true and production credentials")
+			os.Exit(1)
+		}
+		report := promote.New(stagingClient, productionClient, promoteCfg).Run(ctx, floor)
+		logPublishReport(report)
+		if err := report.Err(); err != nil {
+			log.Printf("FAILED: publish to production: %v", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
 	// Create sync manager and run sync
 	log.Println("Creating HourlySyncManager...")
-	syncManager := handlers.NewHourlySyncManager(stagingClient, productionClient, debugMode, apiUsageRecorder)
+	syncManager := handlers.NewHourlySyncManager(stagingClient, syncMirror, debugMode, apiUsageRecorder)
 
 	log.Println("Starting sync execution...")
 	syncManager.RunHourlySync(marketplace)
@@ -136,7 +190,51 @@ func main() {
 	log.Printf("Failed ASINs           : %d", status.FailedASINs)
 	log.Printf("Total API Calls        : %d", status.TotalAPICalls)
 
-	os.Exit(exitCodeFor(status))
+	// Exit code is decided before publishing, because it also decides whether to
+	// publish at all: a run that stopped early, was truncated, or lost too many
+	// ASINs must not push its partial result into production.
+	exitCode := exitCodeFor(status)
+
+	switch {
+	case !publishing:
+		log.Println("Publish tail skipped — not enabled, or production is not configured")
+	case exitCode != 0:
+		log.Println("Publish tail SKIPPED — the sync run was not healthy, production is left untouched")
+	default:
+		report := promote.New(stagingClient, productionClient, promoteCfg).Run(ctx, floor)
+		logPublishReport(report)
+		if err := report.Err(); err != nil {
+			log.Printf("FAILED: publish to production: %v", err)
+			log.Println("Staging is complete and the bookmark is checkpointed — a PROMOTE_ONLY re-run will resume")
+			exitCode = 1
+		}
+	}
+
+	os.Exit(exitCode)
+}
+
+// logPublishReport writes the per-table outcome of a publish. A publish runs
+// unattended once every ten days, so its own log is the only record of what
+// moved.
+func logPublishReport(report promote.Report) {
+	log.Printf("=== Publish to Production Completed ===")
+	for _, t := range report.Tables {
+		if t.Err != nil {
+			log.Printf("  %-40s FAILED after %d row(s): %v", t.Table, t.RowsSent, t.Err)
+			continue
+		}
+		log.Printf("  %-40s read=%-8d sent=%-8d guarded=%-8d watermark=%s%s",
+			t.Table, t.RowsRead, t.RowsSent, t.RowsGuarded, t.Watermark.Format(time.RFC3339),
+			throttleNote(t.Throttled))
+	}
+	log.Printf("  %-40s %d row(s) in %s", "TOTAL", report.RowsSent(), report.Duration.Round(time.Second))
+}
+
+func throttleNote(throttled bool) string {
+	if throttled {
+		return " (THROTTLED by PROMOTE_MAX_ROWS_PER_RUN — re-run with PROMOTE_ONLY=true to continue)"
+	}
+	return ""
 }
 
 // exitCodeFor decides the job's exit code from the finished run.
