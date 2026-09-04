@@ -1887,10 +1887,7 @@ func (m *HourlySyncManager) asinSourceLabel() string {
 func (m *MasterSyncManager) sendDiscordNotification(syncMode string) {
 	// Get webhook URL from environment or use the provided one
 	webhookURL := os.Getenv("DISCORD_WEBHOOK_URL")
-	if webhookURL == "" {
-		// Use the provided webhook URL as default
-		webhookURL = "https://discord.com/api/webhooks/1422178082483212348/g7q_D2qbjrZNMbIgmGV8AuegJCL7GOLA0QZrcoPMgB5J4Cpxnl_PCexzDzUP6sbJMxTz"
-	}
+	
 
 	// Calculate duration
 	duration := time.Since(m.status.StartedAt).Round(time.Second)
