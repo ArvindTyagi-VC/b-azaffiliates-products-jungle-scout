@@ -94,3 +94,16 @@ func TestParseRetryAgainAtRejectsUnusable(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveNextLink(t *testing.T) {
+	c := &Client{baseURL: "https://developer.junglescout.com/api"}
+	cases := map[string]string{
+		"https://developer.junglescout.com/api/product_database_query?page%5Bcursor%5D=x": "https://developer.junglescout.com/api/product_database_query?page%5Bcursor%5D=x",
+		"/api/product_database_query?page%5Bcursor%5D=x":                                 "https://developer.junglescout.com/api/product_database_query?page%5Bcursor%5D=x",
+	}
+	for in, want := range cases {
+		if got := c.resolve(in); got != want {
+			t.Errorf("resolve(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
