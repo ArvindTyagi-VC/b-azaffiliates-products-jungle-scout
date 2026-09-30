@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+
+	"github.com/lib/pq"
 )
 
 // HeliumWrittenTable records the Jungle Scout rows written by /helium-js jobs.
@@ -13,6 +15,21 @@ const HeliumWrittenTable = "helium_js_written"
 // Execer is satisfied by *sql.DB and *sql.Tx.
 type Execer interface {
 	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+}
+
+// MarkHeliumWrittenMany is MarkHeliumWritten for several ASINs sharing one
+// date range, in one statement.
+func MarkHeliumWrittenMany(ctx context.Context, db Execer, markerTable, dataTable string, asins []string, marketplace, fromDate, toDate string) error {
+	if len(asins) == 0 {
+		return nil
+	}
+	_, err := db.ExecContext(ctx, fmt.Sprintf(`
+		INSERT INTO %s (table_name, asin, marketplace, from_date, to_date)
+		SELECT $1, a, $3, $4::date, $5::date FROM unnest($2::text[]) AS a
+		ON CONFLICT (table_name, asin, marketplace, from_date, to_date) DO UPDATE
+		   SET written_at = NOW(), written_at_local = LOCALTIMESTAMP`, markerTable),
+		dataTable, pq.Array(asins), marketplace, fromDate, toDate)
+	return err
 }
 
 // MarkHeliumWritten records that dataTable rows for asin between fromDate and

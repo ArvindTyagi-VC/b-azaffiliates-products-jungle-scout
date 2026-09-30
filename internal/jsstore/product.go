@@ -73,6 +73,26 @@ func ProductUpsertSQL(table string) string {
 	`, table)
 }
 
+// productColumns is the number of ProductUpsertSQL parameters per row.
+const productColumns = 42
+
+// ProductUpsertManySQL is ProductUpsertSQL for rows products in one statement.
+// The rows must not repeat an (asin, report_date) key.
+func ProductUpsertManySQL(table string, rows int) string {
+	single := ProductUpsertSQL(table)
+	values := strings.Index(single, "VALUES")
+	conflict := strings.Index(single, "ON CONFLICT")
+	tuples := make([]string, rows)
+	for r := 0; r < rows; r++ {
+		params := make([]string, productColumns)
+		for c := 0; c < productColumns; c++ {
+			params[c] = fmt.Sprintf("$%d", r*productColumns+c+1)
+		}
+		tuples[r] = "(" + strings.Join(params, ", ") + ")"
+	}
+	return single[:values] + "VALUES " + strings.Join(tuples, ",\n\t\t\t") + "\n\t\t" + single[conflict:]
+}
+
 // ProductASIN is the ASIN a product row is stored under: the ID, without the
 // "us/" style marketplace prefix JungleScout puts on it.
 func ProductASIN(p junglescout.ProductData) string {

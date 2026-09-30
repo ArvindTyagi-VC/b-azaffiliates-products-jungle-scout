@@ -27,16 +27,28 @@ func (w stagingWriter) products(ctx context.Context, products []junglescout.Prod
 	if len(products) == 0 {
 		return nil
 	}
+	// One statement for the rows and one for their markers, rather than two
+	// round trips per product: over the network from Cloud Run that was most
+	// of a batch's time.
+	seen := make(map[string]bool, len(products))
+	var asins []string
+	var args []interface{}
+	for _, p := range products {
+		asin := jsstore.ProductASIN(p)
+		if seen[asin] {
+			continue
+		}
+		seen[asin] = true
+		asins = append(asins, asin)
+		args = append(args, jsstore.ProductArgs(p, reportDate)...)
+	}
 	return w.inTx(ctx, func(tx *sql.Tx) error {
-		query := jsstore.ProductUpsertSQL(w.pg.TableName(productTable))
-		for _, p := range products {
-			asin := jsstore.ProductASIN(p)
-			if _, err := tx.ExecContext(ctx, query, jsstore.ProductArgs(p, reportDate)...); err != nil {
-				return fmt.Errorf("product %s: %w", asin, err)
-			}
-			if err := jsstore.MarkHeliumWritten(ctx, tx, w.marker(), productTable, asin, "", reportDate, reportDate); err != nil {
-				return fmt.Errorf("mark product %s: %w", asin, err)
-			}
+		query := jsstore.ProductUpsertManySQL(w.pg.TableName(productTable), len(asins))
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+			return fmt.Errorf("store %d products: %w", len(asins), err)
+		}
+		if err := jsstore.MarkHeliumWrittenMany(ctx, tx, w.marker(), productTable, asins, "", reportDate, reportDate); err != nil {
+			return fmt.Errorf("mark %d products: %w", len(asins), err)
 		}
 		return nil
 	})
