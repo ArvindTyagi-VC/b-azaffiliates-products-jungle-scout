@@ -2,9 +2,13 @@ package api
 
 import (
 	"log"
+	"os"
+	"strconv"
 
 	"azaffiliates/internal/api/handlers"
 	"azaffiliates/internal/auth"
+	"azaffiliates/internal/heliumjs"
+	"azaffiliates/internal/junglescout"
 )
 
 // setupRoutes configures all the routes for the API
@@ -44,7 +48,40 @@ func (s *Server) setupRoutes() {
 		cloudJobRoutes.GET("/hourly-sync/status", handlers.GetJSHourlySyncStatus(s.GetStagingClient(), s.GetProductionClient()))
 	}
 
+	// Jungle Scout fetches for Helium10 P1/P2/P3 ASINs. Staging only: the
+	// service has no production client and refuses any database but staging.
+	heliumJS := heliumjs.NewService(s.GetStagingClient(), s.stagingOnlyJSClient(), envInt("HELIUM_JS_WORKERS", 8))
+	heliumJSRoutes := router.Group("/helium-js")
+	heliumJSRoutes.Use(auth.APIKeyAuth())
+	{
+		heliumJSRoutes.POST("/fetch", handlers.HeliumJSFetch(heliumJS))
+		heliumJSRoutes.POST("/fetch-found", handlers.HeliumJSFetchFromRun(heliumJS, heliumjs.SourceHeliumFound))
+		heliumJSRoutes.POST("/fetch-missing", handlers.HeliumJSFetchFromRun(heliumJS, heliumjs.SourceHeliumMissing))
+		heliumJSRoutes.GET("/jobs", handlers.HeliumJSJobs(heliumJS))
+		heliumJSRoutes.GET("/jobs/:job_id", handlers.HeliumJSJob(heliumJS))
+		heliumJSRoutes.GET("/jobs/:job_id/asins", handlers.HeliumJSJobASINs(heliumJS))
+	}
+
 	log.Println("Routes set up successfully")
 	log.Printf("Server configured with Staging: %v, Production: %v",
 		s.stagingClient != nil, s.productionClient != nil)
+}
+
+// stagingOnlyJSClient is a Jungle Scout client whose usage is recorded on
+// staging only, or nil when JUNGLE_SCOUT_API_KEY is unset.
+func (s *Server) stagingOnlyJSClient() *junglescout.Client {
+	if os.Getenv("JUNGLE_SCOUT_API_KEY") == "" {
+		return nil
+	}
+	client := junglescout.NewClient()
+	client.SetUsageRecorder(junglescout.NewDBAPIUsageRecorder(s.GetStagingClient(), nil))
+	return client
+}
+
+// envInt reads a positive integer from the environment, or def.
+func envInt(key string, def int) int {
+	if n, err := strconv.Atoi(os.Getenv(key)); err == nil && n > 0 {
+		return n
+	}
+	return def
 }

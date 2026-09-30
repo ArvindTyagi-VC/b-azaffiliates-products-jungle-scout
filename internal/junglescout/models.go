@@ -51,7 +51,14 @@ type ProductData struct {
 
 // ProductAPIResponse represents the response from the product database API
 type ProductAPIResponse struct {
-	Data []ProductData `json:"data"`
+	Data  []ProductData `json:"data"`
+	Links struct {
+		Self string `json:"self"`
+		Next string `json:"next"`
+	} `json:"links"`
+	Meta struct {
+		TotalItems int `json:"total_items"`
+	} `json:"meta"`
 }
 
 // SalesEstimateDataPoint represents a single day's sales data

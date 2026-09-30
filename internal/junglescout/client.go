@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -83,6 +84,22 @@ func parseRetryAgainAt(detail string) time.Duration {
 		return 0
 	}
 	return 0
+}
+
+// APIError is a non-200 answer from JungleScout.
+type APIError struct {
+	Status int
+	Body   string
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("API request failed with status %d: %s", e.Status, e.Body)
+}
+
+// NoData reports whether the answer means JungleScout has no data for the
+// ASIN (for example MISSING_RANK_DATA), as opposed to a failed call.
+func (e *APIError) NoData() bool {
+	return e.Status == http.StatusUnprocessableEntity || e.Status == http.StatusNotFound
 }
 
 // Client represents a JungleScout API client with rate limiting
@@ -236,7 +253,54 @@ func (c *Client) FetchProductData(asins []string, marketplace string) (*ProductA
 	}
 
 
-	requestBody := map[string]interface{}{
+	requestBody := productQueryBody(asins)
+
+	endpoint := fmt.Sprintf("%s/product_database_query?marketplace=%s&sort=name&page[size]=100", c.baseURL, marketplace)
+	return c.fetchProductPage(endpoint, requestBody)
+}
+
+// FetchProductDataAll is FetchProductData that also follows links.next, so a
+// query matching more than one page cannot silently drop requested ASINs.
+func (c *Client) FetchProductDataAll(asins []string, marketplace string) (*ProductAPIResponse, error) {
+	first, err := c.FetchProductData(asins, marketplace)
+	if err != nil {
+		return nil, err
+	}
+	requestBody := productQueryBody(asins)
+	for next, pages := first.Links.Next, 1; next != ""; pages++ {
+		if pages >= maxProductPages {
+			return nil, fmt.Errorf("product query still had a next page after %d pages", pages)
+		}
+		page, err := c.fetchProductPage(c.resolve(next), requestBody)
+		if err != nil {
+			return nil, err
+		}
+		first.Data = append(first.Data, page.Data...)
+		next = page.Links.Next
+	}
+	return first, nil
+}
+
+// resolve turns a links.next value into an absolute URL, in case the API
+// returns it relative to its own host.
+func (c *Client) resolve(link string) string {
+	base, err := url.Parse(c.baseURL)
+	if err != nil {
+		return link
+	}
+	ref, err := url.Parse(link)
+	if err != nil {
+		return link
+	}
+	return base.ResolveReference(ref).String()
+}
+
+// maxProductPages bounds FetchProductDataAll: 100 exact ASINs cannot
+// legitimately need more pages than this.
+const maxProductPages = 20
+
+func productQueryBody(asins []string) map[string]interface{} {
+	return map[string]interface{}{
 		"data": map[string]interface{}{
 			"type": "product_database_query",
 			"attributes": map[string]interface{}{
@@ -244,9 +308,9 @@ func (c *Client) FetchProductData(asins []string, marketplace string) (*ProductA
 			},
 		},
 	}
+}
 
-	endpoint := fmt.Sprintf("%s/product_database_query?marketplace=%s&sort=name&page[size]=100", c.baseURL, marketplace)
-
+func (c *Client) fetchProductPage(endpoint string, requestBody map[string]interface{}) (*ProductAPIResponse, error) {
 	resp, err := c.doRequest("POST", endpoint, requestBody)
 	if err != nil {
 		return nil, err
@@ -256,7 +320,7 @@ func (c *Client) FetchProductData(asins []string, marketplace string) (*ProductA
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+		return nil, &APIError{Status: resp.StatusCode, Body: string(body)}
 	}
 
 	var apiResponse ProductAPIResponse
@@ -311,7 +375,7 @@ func (c *Client) FetchSalesEstimateData(asin, marketplace, startDate, endDate st
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+		return nil, &APIError{Status: resp.StatusCode, Body: string(body)}
 	}
 
 	bodyBytes, err := io.ReadAll(resp.Body)
