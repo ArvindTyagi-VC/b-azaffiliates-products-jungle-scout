@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"azaffiliates/internal/database"
+	"azaffiliates/internal/jsstore"
 
 	"github.com/lib/pq"
 )
@@ -34,7 +35,7 @@ func (s *store) checkEnvironment(ctx context.Context) error {
 	if db != ExpectedDatabase {
 		return fmt.Errorf("%w: connected to %q, jobs only run on %q", ErrPrecondition, db, ExpectedDatabase)
 	}
-	for _, t := range []string{s.jobs(), s.results()} {
+	for _, t := range []string{s.jobs(), s.results(), s.pg.TableName(jsstore.HeliumWrittenTable)} {
 		var found bool
 		if err := s.pg.DB.QueryRowContext(ctx, `SELECT to_regclass($1) IS NOT NULL`, t).Scan(&found); err != nil {
 			return fmt.Errorf("check table %s: %w", t, err)

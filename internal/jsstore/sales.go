@@ -2,7 +2,6 @@ package jsstore
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 
 	"azaffiliates/internal/junglescout"
@@ -13,7 +12,7 @@ import (
 // UpsertSales writes one sales_estimates_query series into the
 // jungle_scout_sales_estimate_data table named table, in a single statement.
 // Existing days are updated and days outside the series are left alone.
-func UpsertSales(ctx context.Context, db *sql.DB, table, marketplace string, a junglescout.SalesEstimateAttributes) (int, error) {
+func UpsertSales(ctx context.Context, db Execer, table, marketplace string, a junglescout.SalesEstimateAttributes) (int, error) {
 	if len(a.Data) == 0 {
 		return 0, nil
 	}

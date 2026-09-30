@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"azaffiliates/internal/database"
+	"azaffiliates/internal/jsstore"
 
 	"github.com/lib/pq"
 )
@@ -94,6 +95,10 @@ type TableSpec struct {
 	// target row whose value is newer keeps its data untouched. Leave empty to
 	// let the publish overwrite unconditionally.
 	FreshnessCol string
+	// HeliumKey matches a row to its helium_js_written marker, with %[1]s
+	// standing for the source table. Rows whose last write was a /helium-js job
+	// are left out of the publish; they are moved to production by hand.
+	HeliumKey string
 }
 
 // Specs is the set of tables the publish covers.
@@ -103,6 +108,7 @@ var Specs = []TableSpec{
 		ConflictCols:  []string{"asin", "report_date"},
 		WatermarkExpr: "GREATEST(COALESCE(updated_at, created_at), COALESCE(created_at, updated_at))",
 		TiebreakCols:  []string{"asin", "report_date"},
+		HeliumKey:     "w.asin = %[1]s.asin AND %[1]s.report_date BETWEEN w.from_date AND w.to_date",
 	},
 	{
 		Name:         "jungle_scout_sales_estimate_data",
@@ -120,6 +126,7 @@ var Specs = []TableSpec{
 		// the column that read path stamps and then reads back for its own
 		// freshness window — so a publish never walks a fresher series back.
 		FreshnessCol: "created_at",
+		HeliumKey:    "w.asin = %[1]s.asin AND w.marketplace = %[1]s.marketplace AND %[1]s.date BETWEEN w.from_date AND w.to_date",
 	},
 }
 
@@ -309,8 +316,14 @@ func (m *Migrator) publishTable(ctx context.Context, spec TableSpec, floor Floor
 
 	guardCol := resolveFreshnessCol(spec, cols, m.cfg.ConflictMode)
 
-	firstPageSQL := buildSelect(srcTable, cols, spec, rowsPerStatement, false)
-	resumeSQL := buildSelect(srcTable, cols, spec, rowsPerStatement, true)
+	exclude, err := m.heliumExclusion(ctx, spec, srcTable)
+	if err != nil {
+		tr.Err = err
+		tr.Duration = time.Since(started)
+		return tr
+	}
+	firstPageSQL := buildSelect(srcTable, cols, spec, rowsPerStatement, false, exclude)
+	resumeSQL := buildSelect(srcTable, cols, spec, rowsPerStatement, true, exclude)
 	insertSQL := buildInsert(dstTable, cols, spec, m.cfg.ConflictMode, guardCol)
 
 	var cursor []interface{} // last (watermark, tiebreak...) seen; nil on the first page
@@ -616,7 +629,36 @@ func (m *Migrator) saveBookmark(ctx context.Context, spec TableSpec, wm time.Tim
 }
 
 
-func buildSelect(table string, cols []string, spec TableSpec, limit int, withCursor bool) string {
+// heliumExclusion is the WHERE fragment that leaves out rows last written by a
+// /helium-js job, or "" when the table has no HeliumKey or the marker table
+// does not exist (then no such job can have run).
+func (m *Migrator) heliumExclusion(ctx context.Context, spec TableSpec, srcTable string) (string, error) {
+	if spec.HeliumKey == "" {
+		return "", nil
+	}
+	marker := m.src.TableName(jsstore.HeliumWrittenTable)
+	var exists bool
+	if err := m.src.DB.QueryRowContext(ctx, `SELECT to_regclass($1) IS NOT NULL`, marker).Scan(&exists); err != nil {
+		return "", fmt.Errorf("check %s: %w", marker, err)
+	}
+	if !exists {
+		return "", nil
+	}
+	log.Printf("[PROMOTE] %s: leaving out rows last written by /helium-js jobs (%s)", spec.Name, marker)
+	return heliumExclusionSQL(spec, srcTable, marker), nil
+}
+
+func heliumExclusionSQL(spec TableSpec, srcTable, marker string) string {
+	clock := "w.written_at"
+	if spec.NaiveClock {
+		clock = "w.written_at_local"
+	}
+	return fmt.Sprintf(" AND NOT EXISTS (SELECT 1 FROM %s w WHERE w.table_name = %s AND %s AND %s <= %s + interval '1 minute')",
+		pq.QuoteIdentifier(marker), pq.QuoteLiteral(spec.Name),
+		fmt.Sprintf(spec.HeliumKey, pq.QuoteIdentifier(srcTable)), spec.WatermarkExpr, clock)
+}
+
+func buildSelect(table string, cols []string, spec TableSpec, limit int, withCursor bool, exclude string) string {
 	quoted := make([]string, len(cols))
 	for i, c := range cols {
 		quoted[i] = pq.QuoteIdentifier(c)
@@ -628,7 +670,7 @@ func buildSelect(table string, cols []string, spec TableSpec, limit int, withCur
 		trailing = append(trailing, pq.QuoteIdentifier(c))
 	}
 
-	where := fmt.Sprintf("%s >= $1", spec.WatermarkExpr)
+	where := fmt.Sprintf("%s >= $1%s", spec.WatermarkExpr, exclude)
 	if withCursor {
 		slots := make([]string, len(trailing))
 		for i := range trailing {
