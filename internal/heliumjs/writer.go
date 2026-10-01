@@ -55,24 +55,7 @@ func (w stagingWriter) products(ctx context.Context, products []junglescout.Prod
 }
 
 func (w stagingWriter) sales(ctx context.Context, series junglescout.SalesEstimateAttributes) error {
-	if len(series.Data) == 0 {
-		return nil
-	}
-	from, to := series.Data[0].Date, series.Data[0].Date
-	for _, d := range series.Data {
-		if d.Date < from {
-			from = d.Date
-		}
-		if d.Date > to {
-			to = d.Date
-		}
-	}
-	return w.inTx(ctx, func(tx *sql.Tx) error {
-		if _, err := jsstore.UpsertSales(ctx, tx, w.pg.TableName(salesTable), marketplace, series); err != nil {
-			return err
-		}
-		return jsstore.MarkHeliumWritten(ctx, tx, w.marker(), salesTable, series.ASIN, marketplace, from, to)
-	})
+	return jsstore.UpsertSalesMarked(ctx, w.pg.DB, w.pg.TableName(salesTable), w.marker(), salesTable, marketplace, series)
 }
 
 func (w stagingWriter) marker() string { return w.pg.TableName(jsstore.HeliumWrittenTable) }

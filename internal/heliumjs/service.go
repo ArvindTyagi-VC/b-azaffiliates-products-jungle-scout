@@ -202,7 +202,7 @@ func (s *Service) fetchProducts(ctx context.Context, jobID int64, asins []string
 				returned = append(returned, p)
 			}
 		}
-		if err := s.data.products(ctx, returned, reportDate); err != nil {
+		if err := withDBRetry(ctx, "store products", func() error { return s.data.products(ctx, returned, reportDate) }); err != nil {
 			counts.Product.Failed += len(batch)
 			counts.Product.NotSent = len(asins) - end
 			return fmt.Errorf("store products: %w", err)
@@ -219,7 +219,7 @@ func (s *Service) fetchProducts(ctx context.Context, jobID int64, asins []string
 			}
 			rows = append(rows, ASINResult{ASIN: a, Product: result})
 		}
-		if err := s.jobs.record(ctx, jobID, rows); err != nil {
+		if err := withDBRetry(ctx, "record product results", func() error { return s.jobs.record(ctx, jobID, rows) }); err != nil {
 			return fmt.Errorf("record product results: %w", err)
 		}
 		s.jobs.progress(ctx, jobID, "product", *counts)
@@ -287,7 +287,9 @@ func (s *Service) fetchSales(jobCtx context.Context, jobID int64, asins []string
 				snapshot := *counts
 				mu.Unlock()
 
-				if recErr := s.jobs.record(jobCtx, jobID, []ASINResult{row}); recErr != nil {
+				if recErr := withDBRetry(jobCtx, "record sales result", func() error {
+					return s.jobs.record(jobCtx, jobID, []ASINResult{row})
+				}); recErr != nil {
 					log.Printf("[HELIUM_JS] job=%d record sales result %s: %v", jobID, asin, recErr)
 				}
 				if report {
@@ -337,7 +339,7 @@ func (s *Service) fetchOne(ctx context.Context, asin, startDate, endDate string)
 	if series.ASIN == "" {
 		series.ASIN = asin
 	}
-	if err := s.data.sales(ctx, series); err != nil {
+	if err := withDBRetry(ctx, "store sales", func() error { return s.data.sales(ctx, series) }); err != nil {
 		return ASINResult{ASIN: asin, Sales: ResultFailed}, 0, retried, fmt.Errorf("store sales for %s: %w", asin, err)
 	}
 	days := len(series.Data)
